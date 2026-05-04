@@ -9,7 +9,7 @@ import requests
 
 MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
 GITHUB_TXT_URLS: List[str] = [
-    "https://raw.githubusercontent.com/<skatzrskx55q>/<repo>/<LH>/<Документ>.txt",
+    # "https://raw.githubusercontent.com/<user>/<repo>/<branch>/<file>.txt",
 ]
 REQUEST_TIMEOUT_SECONDS = 30
 
@@ -203,20 +203,48 @@ def load_text_documents(documents: Sequence[Tuple[str, str]]) -> pd.DataFrame:
     return df
 
 
-def load_github_text_documents(urls: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    source_urls = [url.strip() for url in (urls if urls is not None else GITHUB_TXT_URLS) if str(url).strip()]
-    if not source_urls:
-        raise ValueError("Не указан GitHub TXT-файл. Добавьте raw URL в GITHUB_TXT_URLS в utils.py.")
+def load_txt(url: str) -> pd.DataFrame:
+    response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+    if response.status_code != 200:
+        raise ValueError(f"Ошибка загрузки {url}: HTTP {response.status_code}")
 
-    documents: List[Tuple[str, str]] = []
-    for url in source_urls:
+    source_name = url.rstrip("/").split("/")[-1] or "github.txt"
+    records = parse_txt_cases(decode_text_bytes(response.content), source_name=source_name)
+    if not records:
+        raise ValueError(f"В файле {source_name} не найдено кейсов формата ==текст для поиска==.")
+
+    return pd.DataFrame(records)
+
+
+def load_all_txts() -> pd.DataFrame:
+    dfs = []
+    for url in GITHUB_TXT_URLS:
+        try:
+            dfs.append(load_txt(url))
+        except Exception as exc:
+            print(f"Ошибка с {url}: {exc}")
+
+    if not dfs:
+        raise ValueError("Не удалось загрузить ни одного TXT-файла")
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    model = get_model()
+    df.attrs["phrase_embs"] = model.encode(df["search_proc"].tolist(), convert_to_tensor=True)
+
+    return df
+
+
+def load_github_text_documents(urls: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    if urls is None:
+        return load_all_txts()
+    documents = []
+    for url in urls:
         response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
         if response.status_code != 200:
             raise ValueError(f"Ошибка загрузки {url}: HTTP {response.status_code}")
-
         source_name = url.rstrip("/").split("/")[-1] or "github.txt"
         documents.append((source_name, decode_text_bytes(response.content)))
-
     return load_text_documents(documents)
 
 
@@ -248,7 +276,7 @@ def deduplicate_results(results: Iterable[Dict[str, Any]], top_k: int) -> List[D
     return ordered[:top_k]
 
 
-def semantic_search(query: str, df: pd.DataFrame, top_k: int = 5) -> List[Dict[str, Any]]:
+def semantic_search(query: str, df: pd.DataFrame, top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
     if df.empty:
         return []
 
@@ -259,7 +287,7 @@ def semantic_search(query: str, df: pd.DataFrame, top_k: int = 5) -> List[Dict[s
     sims = util.pytorch_cos_sim(query_emb, df.attrs["phrase_embs"])[0]
 
     ranked = sorted(
-        (_result_from_row(df.iloc[idx], float(score)) for idx, score in enumerate(sims)),
+        (_result_from_row(df.iloc[idx], float(score)) for idx, score in enumerate(sims) if float(score) >= threshold),
         key=lambda item: item["score"],
         reverse=True,
     )

@@ -2,7 +2,7 @@ import html
 
 import streamlit as st
 
-from utils import GITHUB_TXT_URLS, keyword_search, load_github_text_documents, semantic_search
+from utils import GITHUB_TXT_URLS, keyword_search, load_all_txts, semantic_search
 
 
 st.set_page_config(page_title="Помощник разметчика", layout="centered")
@@ -369,39 +369,22 @@ def render_results(title: str, items, total: int, show_scores: bool = False) -> 
     st.markdown("\n".join(parts), unsafe_allow_html=True)
 
 
-SESSION_DF_KEY = "cases_df"
-SESSION_SOURCE_KEY = "cases_sources"
-
-
-def reset_index() -> None:
-    st.session_state.pop(SESSION_DF_KEY, None)
-    st.session_state.pop(SESSION_SOURCE_KEY, None)
-
-
-def ensure_index():
-    if SESSION_DF_KEY not in st.session_state:
-        with st.spinner("Загружаю документ с GitHub и готовлю индекс..."):
-            st.session_state[SESSION_DF_KEY] = load_github_text_documents()
-            st.session_state[SESSION_SOURCE_KEY] = list(GITHUB_TXT_URLS)
-
-    return st.session_state[SESSION_DF_KEY]
+@st.cache_data(show_spinner=False)
+def get_data():
+    return load_all_txts()
 
 
 st.title("Помощник разметчика")
 
-reload_clicked = st.button("Обновить индекс с GitHub", use_container_width=True)
-if reload_clicked:
-    reset_index()
-
 try:
-    df = ensure_index()
+    with st.spinner("Загружаю документы с GitHub и готовлю индекс..."):
+        df = get_data()
 except Exception as exc:
     st.error(f"Не удалось загрузить или разобрать документ: {exc}")
     st.stop()
 
 case_count = df["case_uid"].nunique()
-sources = st.session_state.get(SESSION_SOURCE_KEY) or []
-source_label = ", ".join(sources) if sources else "GitHub"
+source_label = ", ".join(GITHUB_TXT_URLS) if GITHUB_TXT_URLS else "GitHub"
 st.caption(f"Кейсов в индексе: {case_count}. Источник: {source_label}")
 
 query_col, top_k_col = st.columns([4, 1])
