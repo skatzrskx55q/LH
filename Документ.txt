@@ -1,0 +1,7 @@
+==он не выдал деньги==
+Дата: 19.09.2025
+Интенты: General Без вопроса (General_Whithout_Question) → Не выдал деньги (Local_Didnt_Give_Money)
+
+==банкомат не выдал деньги==
+Дата: 19.09.2025
+Интенты: УВ Проблемы с банкоматами (UV_ATM_Problems) → Не выдал деньги (Local_Didnt_Give_Money) → Банкоматы (Local_ATM) → Проблема с банкоматом (Local_ATM_Problem)
