@@ -9,7 +9,7 @@ import requests
 
 MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
 GITHUB_TXT_URLS: List[str] = [
-    # "https://raw.githubusercontent.com/<user>/<repo>/<branch>/<file>.txt",
+    "https://raw.githubusercontent.com/<skatzrskx55q>/<repo>/<LH>/<Документ>.txt",
 ]
 REQUEST_TIMEOUT_SECONDS = 30
 
