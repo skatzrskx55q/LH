@@ -4,9 +4,14 @@ from itertools import product
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+import requests
 
 
 MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
+GITHUB_TXT_URLS: List[str] = [
+    # "https://raw.githubusercontent.com/<user>/<repo>/<branch>/<file>.txt",
+]
+REQUEST_TIMEOUT_SECONDS = 30
 
 CASE_MARKER_RE = re.compile(r"==\s*(?P<title>.*?)\s*==", re.DOTALL)
 SERVICE_FIELD_RE = re.compile(r"^\s*(?P<label>[^:\n]{1,80})\s*:\s*(?P<value>.*)$")
@@ -196,6 +201,23 @@ def load_text_documents(documents: Sequence[Tuple[str, str]]) -> pd.DataFrame:
     model = get_model()
     df.attrs["phrase_embs"] = model.encode(df["search_proc"].tolist(), convert_to_tensor=True)
     return df
+
+
+def load_github_text_documents(urls: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    source_urls = [url.strip() for url in (urls if urls is not None else GITHUB_TXT_URLS) if str(url).strip()]
+    if not source_urls:
+        raise ValueError("Не указан GitHub TXT-файл. Добавьте raw URL в GITHUB_TXT_URLS в utils.py.")
+
+    documents: List[Tuple[str, str]] = []
+    for url in source_urls:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            raise ValueError(f"Ошибка загрузки {url}: HTTP {response.status_code}")
+
+        source_name = url.rstrip("/").split("/")[-1] or "github.txt"
+        documents.append((source_name, decode_text_bytes(response.content)))
+
+    return load_text_documents(documents)
 
 
 def _result_from_row(row: pd.Series, score: Optional[float] = None) -> Dict[str, Any]:
