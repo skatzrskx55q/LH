@@ -320,9 +320,9 @@ query_col, top_k_sem_col, top_k_ex_col = st.columns([8, 1.1, 1.1])
 with query_col:
     query = st.text_input("Поисковый запрос", placeholder="Например: ошибка подключения...")
 with top_k_sem_col:
-    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1")
+    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1)
 with top_k_ex_col:
-    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для точного поиска")
+    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1)
 
 if df.empty:
     st.warning("⚠️ База пуста или выбранные документы не содержат корректных данных для поиска (например, нет меток ==заголовок==).")
