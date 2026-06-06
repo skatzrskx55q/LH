@@ -57,7 +57,7 @@ header[data-testid="stHeader"] { display: none !important; }
 [data-testid="stExpander"] summary:hover { color: #8b5cf6 !important; }
 [data-testid="stExpander"] svg { fill: currentColor !important; }
 
-/* КАСТОМИЗАЦИЯ MULTISELECT TAGS (Пилюли выбранных файлов) */
+/* КАСТОМИЗАЦИЯ MULTISELECT TAGS */
 span[data-baseweb="tag"] {
     background-color: rgba(139, 92, 246, 0.15) !important;
     color: #d8b4fe !important;
@@ -139,14 +139,11 @@ def field_row(label, value, stacked: bool = False) -> str:
     lbl = escape(label)
     val = str(value or "-")
     
-    # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Меняем системные переносы на HTML-теги <br>, 
-    # чтобы Markdown парсер Streamlit их не "съел"
     val_html = escape(val).replace("\n", "<br>")
     
     if not lbl:
         return f'<div class="data-row stacked"><div class="data-value">{val_html}</div></div>'
 
-    # МАГИЯ ДЛЯ ИНТЕНТОВ (со стрелочками)
     if "→" in val:
         parts = [p.strip() for p in val.split("→")]
         badges_html = "".join(
@@ -177,7 +174,6 @@ def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
     for field in fields:
         val = field.get("value") or "-"
         lbl = field.get("label", "")
-        # Делаем поле stacked, если текст длинный, если это текст без префикса, или если есть переносы строк
         is_stacked = not lbl or (len(str(val)) > 80 and "→" not in str(val)) or "\n" in str(val)
         html_parts.append(field_row(lbl, val, stacked=is_stacked))
 
@@ -227,7 +223,6 @@ def cached_fetch_url(url: str):
 
 @st.cache_data(show_spinner=False)
 def compile_database(doc_configs: list) -> pd.DataFrame:
-    """Собирает DataFrame из конфигураций каждого отдельного файла."""
     dfs = []
     for cfg in doc_configs:
         records = parse_txt_cases(cfg["text"], cfg["name"], cfg["mode"], cfg["prefixes"])
@@ -243,7 +238,6 @@ def compile_database(doc_configs: list) -> pd.DataFrame:
     return df
 
 
-# Словарь для перевода интерфейса во внутренние флаги парсера
 MODE_MAP = {"Авто": "auto", "Ручной": "custom", "Сплошной": "none"}
 
 # --- НАСТРОЙКИ (UX БЛОК) ---
@@ -253,13 +247,10 @@ with st.expander("⚙️ Источники данных и настройки �
     with col_upload:
         uploaded_files = st.file_uploader("📂 Локальные файлы (.txt)", type="txt", accept_multiple_files=True)
     with col_urls:
-        default_github = ""
+        default_github = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
         github_urls_text = st.text_area("🌐 Ссылки на GitHub (.txt)", value=default_github, height=100)
 
-    # 1. Сбор всех доступных файлов
     available_docs = {}
-    
-    # Парсим URL
     urls = [u.strip() for u in github_urls_text.split("\n") if u.strip()]
     for url in urls:
         doc_name = url.split("/")[-1] or url
@@ -267,7 +258,6 @@ with st.expander("⚙️ Источники данных и настройки �
         if content:
             available_docs[doc_name] = content
             
-    # Парсим локальные загрузки
     if uploaded_files:
         for f in uploaded_files:
             available_docs[f.name] = decode_text_bytes(f.getvalue())
@@ -278,11 +268,9 @@ with st.expander("⚙️ Источники данных и настройки �
         st.info("Нет доступных документов. Загрузите файл или укажите рабочую ссылку.")
         st.stop()
 
-    # 2. Мультивыбор документов
     all_doc_names = list(available_docs.keys())
     active_docs = st.multiselect("📑 Выберите документы для работы:", options=all_doc_names, default=all_doc_names)
 
-    # 3. Индивидуальные настройки префиксов для выбранных документов
     doc_configs = []
     if active_docs:
         st.markdown("<p style='font-size: 13px; color: #a1a1aa; margin-top: 1rem; margin-bottom: 0.5rem;'>ТОНКАЯ НАСТРОЙКА ПАРСИНГА</p>", unsafe_allow_html=True)
@@ -306,10 +294,8 @@ with st.expander("⚙️ Источники данных и настройки �
                 if mode_choice == "Ручной":
                     prefs_str = st.text_input("Укажите префиксы", "Интенты, Дата, Статья", key=f"pref_{doc}")
                 else:
-                    # Заглушка для сохранения верстки
                     st.markdown("<div style='height: 68px;'></div>", unsafe_allow_html=True)
             
-            # Сохраняем итоговый конфиг для документа
             doc_configs.append({
                 "name": doc,
                 "text": available_docs[doc],
@@ -326,11 +312,14 @@ except Exception as exc:
     st.error(f"Ошибка обработки: {exc}")
     st.stop()
 
-query_col, top_k_col = st.columns([4, 1])
+# Обновленный блок с тремя колонками для раздельной настройки Top K
+query_col, top_k_sem_col, top_k_ex_col = st.columns([4, 1.2, 1.2])
 with query_col:
     query = st.text_input("Поисковый запрос", placeholder="Например: ошибка подключения...")
-with top_k_col:
-    top_k = st.number_input("Выдача", min_value=1, max_value=20, value=5, step=1)
+with top_k_sem_col:
+    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для семантического поиска")
+with top_k_ex_col:
+    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для точного поиска")
 
 if df.empty:
     st.warning("⚠️ База пуста или выбранные документы не содержат корректных данных для поиска (например, нет меток ==заголовок==).")
@@ -342,8 +331,9 @@ if not query.strip():
 case_count = df["case_uid"].nunique()
 
 with st.spinner("Анализ данных..."):
-    semantic_results = semantic_search(query, df, top_k=top_k)
-    exact_results = keyword_search(query, df, top_k=top_k)
+    # Передаем раздельные переменные в функции поиска
+    semantic_results = semantic_search(query, df, top_k=top_k_semantic)
+    exact_results = keyword_search(query, df, top_k=top_k_exact)
 
 render_results("Умный поиск (Семантика)", semantic_results, total=case_count, show_scores=True, icon="✨")
 render_results("Точный поиск (Ключи)", exact_results, total=case_count, show_scores=False, icon="🎯")
