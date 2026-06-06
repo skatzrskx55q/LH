@@ -313,15 +313,16 @@ except Exception as exc:
     st.error(f"Ошибка обработки: {exc}")
     st.stop()
 
-# КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Изменены пропорции колонок. 
-# Теперь поисковое поле занимает значительно больше места (6 частей против 1+1 для ползунков).
-query_col, top_k_sem_col, top_k_ex_col = st.columns([6, 1, 1])
+# КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Пропорция [8, 1.1, 1.1] делает строку поиска максимально широкой, 
+# а поля ввода чисел узкими и компактными. Подсказки-вопросики (help) вернулись!
+query_col, top_k_sem_col, top_k_ex_col = st.columns([8, 1.1, 1.1])
+
 with query_col:
     query = st.text_input("Поисковый запрос", placeholder="Например: ошибка подключения...")
 with top_k_sem_col:
-    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1)
+    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для семантического поиска")
 with top_k_ex_col:
-    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1)
+    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для точного поиска")
 
 if df.empty:
     st.warning("⚠️ База пуста или выбранные документы не содержат корректных данных для поиска (например, нет меток ==заголовок==).")
