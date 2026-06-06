@@ -2,53 +2,42 @@ import html
 import streamlit as st
 from utils import keyword_search, load_all_txts, semantic_search
 
-# Настройка страницы всегда идет первой
 st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡")
 
-# Агрессивный CSS для полного перекрытия Streamlit
 DARK_SaaS_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-/* Глобальный сброс и шрифты */
 html, body, [class*="css"] {
     font-family: 'Inter', sans-serif !important;
 }
 
-/* Уничтожаем дефолтный UI Streamlit */
 header {display: none !important;}
 footer {display: none !important;}
 .stDeployButton {display: none !important;}
 div[data-testid="stToolbar"] {display: none !important;}
 
-/* Убираем гигантские отступы Streamlit */
 .block-container {
     padding-top: 2rem !important;
     padding-bottom: 4rem !important;
     max-width: 850px !important;
 }
 
-/* =========================================
-   КАСТОМИЗАЦИЯ НАТИВНЫХ ИНПУТОВ STREAMLIT
-   ========================================= */
-/* Поля ввода (Text & Number) */
 div[data-baseweb="input"] > div, 
 div[data-baseweb="base-input"] {
-    background-color: #18181b !important; /* Глубокий серый/черный */
+    background-color: #18181b !important;
     border: 1px solid #27272a !important;
     border-radius: 12px !important;
     color: #f4f4f5 !important;
     transition: all 0.2s ease;
 }
 
-/* Фокус на полях ввода */
 div[data-baseweb="input"] > div:focus-within {
-    border-color: #8b5cf6 !important; /* Фиолетовый неон */
+    border-color: #8b5cf6 !important;
     box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.25) !important;
     background-color: #09090b !important;
 }
 
-/* Текст лейблов над инпутами */
 div[data-testid="stTextInput"] label p, 
 div[data-testid="stNumberInput"] label p {
     color: #a1a1aa !important;
@@ -59,15 +48,11 @@ div[data-testid="stNumberInput"] label p {
     margin-bottom: 4px;
 }
 
-/* =========================================
-   КАСТОМНЫЕ ЭЛЕМЕНТЫ (РЕЗУЛЬТАТЫ ПОИСКА)
-   ========================================= */
 .app-container {
     color: #f4f4f5;
     margin-bottom: 2rem;
 }
 
-/* Панель статистики */
 .stats-panel {
     display: flex;
     justify-content: space-between;
@@ -98,7 +83,6 @@ div[data-testid="stNumberInput"] label p {
     border: 1px solid #3f3f46;
 }
 
-/* Карточка результата */
 .modern-card {
     background: #18181b;
     border: 1px solid #27272a;
@@ -115,7 +99,6 @@ div[data-testid="stNumberInput"] label p {
     box-shadow: 0 12px 24px -8px rgba(0, 0, 0, 0.5);
 }
 
-/* Эффект свечения для лучшего совпадения */
 .modern-card.is-best {
     border-color: #8b5cf6;
     background: linear-gradient(180deg, rgba(139, 92, 246, 0.05) 0%, #18181b 100%);
@@ -127,7 +110,6 @@ div[data-testid="stNumberInput"] label p {
     background: linear-gradient(90deg, #8b5cf6, #3b82f6);
 }
 
-/* Шапка карточки */
 .card-header {
     display: flex;
     gap: 16px;
@@ -160,7 +142,6 @@ div[data-testid="stNumberInput"] label p {
     flex: 1;
 }
 
-/* Поля данных (Key-Value) */
 .data-grid {
     display: flex;
     flex-direction: column;
@@ -208,7 +189,6 @@ div[data-testid="stNumberInput"] label p {
     margin: 0;
 }
 
-/* Метка Score */
 .score-pill {
     display: inline-flex;
     align-items: center;
@@ -232,16 +212,9 @@ def escape(value) -> str:
 def field_row(label, value, stacked: bool = False) -> str:
     lbl = escape(label)
     val = escape(str(value or "-"))
-    # Сохраняем переносы строк
-    val_html = f"<pre>{val}</pre>"
     stacked_cls = " stacked" if stacked else ""
-    
-    return f"""
-    <div class="data-row{stacked_cls}">
-        <div class="data-label">{lbl}</div>
-        <div class="data-value">{val_html}</div>
-    </div>
-    """
+    # Весь HTML генерируется в одну строку без отступов, чтобы Streamlit не сломал его
+    return f'<div class="data-row{stacked_cls}"><div class="data-label">{lbl}</div><div class="data-value"><pre>{val}</pre></div></div>'
 
 
 def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
@@ -263,24 +236,20 @@ def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
         is_stacked = len(str(val)) > 80 or "\n" in str(val)
         html_parts.append(field_row(field.get("label", "Поле"), val, stacked=is_stacked))
 
-    html_parts.append('</div>') # end data-grid
+    html_parts.append('</div>')
 
     if show_score and item.get("score") is not None:
         html_parts.append(f'<div class="score-pill">Score: {item["score"]:.3f}</div>')
 
-    html_parts.append('</div>') # end modern-card
-    return "\n".join(html_parts)
+    html_parts.append('</div>')
+    # Склеиваем без переносов строк (newline), чтобы избежать конфликта с Markdown
+    return "".join(html_parts)
 
 
 def render_results(title: str, items, total: int, show_scores: bool = False, icon: str = "🔍") -> None:
     html_parts = [
         '<div class="app-container">',
-        f'''
-        <div class="stats-panel">
-            <div class="stats-title">{icon} {escape(title)}</div>
-            <div class="stats-badge">{len(items)} / {total} совпадений</div>
-        </div>
-        '''
+        f'<div class="stats-panel"><div class="stats-title">{icon} {escape(title)}</div><div class="stats-badge">{len(items)} / {total} совпадений</div></div>'
     ]
 
     if not items:
@@ -291,17 +260,15 @@ def render_results(title: str, items, total: int, show_scores: bool = False, ico
             html_parts.append(render_card(item, rank=idx + 1, show_score=show_scores, is_best=is_best))
 
     html_parts.append('</div>')
-    st.markdown("\n".join(html_parts), unsafe_allow_html=True)
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
-# Внедряем CSS
 st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
 
 @st.cache_data(show_spinner=False)
 def get_data():
     return load_all_txts()
 
-# Кастомный Hero-заголовок
 st.markdown("""
 <div style="text-align: center; margin-bottom: 3rem; padding-top: 1rem;">
     <h1 style="font-size: 2.5rem; font-weight: 800; margin-bottom: 0.5rem; background: linear-gradient(to right, #ffffff, #a1a1aa); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
@@ -320,7 +287,6 @@ except Exception as exc:
 
 case_count = df["case_uid"].nunique()
 
-# Контейнер для поиска
 query_col, top_k_col = st.columns([4, 1])
 with query_col:
     query = st.text_input("Поисковый запрос", placeholder="Введите текст, ошибку или ключевые слова...")
@@ -334,6 +300,5 @@ with st.spinner("Анализ данных..."):
     semantic_results = semantic_search(query, df, top_k=top_k)
     exact_results = keyword_search(query, df, top_k=top_k)
 
-# Отрисовка
 render_results("Умный поиск (Семантика)", semantic_results, total=case_count, show_scores=True, icon="✨")
 render_results("Точный поиск (Ключи)", exact_results, total=case_count, show_scores=False, icon="🎯")
