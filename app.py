@@ -2,6 +2,7 @@ import html
 import streamlit as st
 from utils import keyword_search, load_combined_data, semantic_search, decode_text_bytes
 
+# Настройка страницы всегда должна быть первой командой Streamlit
 st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="expanded")
 
 DARK_SaaS_CSS = """
@@ -13,43 +14,57 @@ html, body, [class*="css"] {
 }
 
 /* =========================================
-   ИСПРАВЛЕНИЕ САЙДБАРА И ХЕДЕРА
+   ИСПРАВЛЕНИЕ ШАПКИ И КНОПКИ САЙДБАРА
    ========================================= */
-/* Делаем хедер прозрачным, но не удаляем его, чтобы кнопка сайдбара жила */
-header {
-    background-color: transparent !important;
+/* Делаем сам контейнер шапки прозрачным и кликабельным насквозь */
+[data-testid="stHeader"] {
+    background: transparent !important;
     box-shadow: none !important;
+    pointer-events: none !important; /* Чтобы не перекрывать контент под шапкой */
 }
-/* Прячем только мусорное меню Streamlit справа */
-[data-testid="stToolbar"], .stDeployButton {
-    display: none !important;
-}
-footer {display: none !important;}
 
-/* Стилизуем кнопку открытия сайдбара (когда он свернут) */
-[data-testid="collapsedControl"] {
-    color: #a1a1aa !important;
-    background-color: rgba(24, 24, 27, 0.6) !important;
-    border: 1px solid rgba(63, 63, 70, 0.5) !important;
-    border-radius: 8px !important;
-    backdrop-filter: blur(8px) !important;
-    margin: 14px;
-    transition: all 0.2s ease;
+/* Убираем ТОЛЬКО мусор справа (Deploy, Меню, Индикатор загрузки) */
+[data-testid="stToolbar"], 
+.stDeployButton, 
+[data-testid="stStatusWidget"] {
+    display: none !important;
+    visibility: hidden !important;
 }
+
+/* ФОРСИРУЕМ ОТОБРАЖЕНИЕ КНОПКИ САЙДБАРА (Стрелочки) */
+[data-testid="collapsedControl"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important; /* Возвращаем кликабельность кнопке */
+    z-index: 999999 !important; /* Вытаскиваем на самый верх */
+    
+    /* Стилизуем под дизайн */
+    color: #f4f4f5 !important;
+    background: rgba(24, 24, 27, 0.7) !important;
+    border: 1px solid rgba(139, 92, 246, 0.4) !important;
+    border-radius: 8px !important;
+    margin: 1rem !important;
+    backdrop-filter: blur(8px) !important;
+    transition: all 0.2s ease !important;
+}
+
 [data-testid="collapsedControl"]:hover {
     color: #ffffff !important;
-    background-color: rgba(139, 92, 246, 0.4) !important;
+    background: rgba(139, 92, 246, 0.4) !important;
     border-color: #8b5cf6 !important;
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.3) !important;
 }
 
-/* Стилизуем кнопку закрытия внутри самого сайдбара */
+/* Стилизуем крестик (закрытие) внутри самого сайдбара */
 [data-testid="stSidebarCollapseButton"] {
     color: #a1a1aa !important;
-    transition: all 0.2s ease;
+    transition: color 0.2s ease !important;
 }
 [data-testid="stSidebarCollapseButton"]:hover {
     color: #8b5cf6 !important;
 }
+/* ========================================= */
 
 
 /* АНИМИРОВАННЫЙ ГРАДИЕНТНЫЙ ФОН ПРИЛОЖЕНИЯ */
@@ -67,7 +82,7 @@ footer {display: none !important;}
 }
 
 .block-container {
-    padding-top: 2rem !important;
+    padding-top: 3rem !important; /* Чуть увеличили отступ, чтобы кнопка не наезжала на заголовок */
     padding-bottom: 4rem !important;
     max-width: 850px !important;
 }
@@ -386,6 +401,7 @@ def render_results(title: str, items, total: int, show_scores: bool = False, ico
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
+# Внедряем глобальный кастомный CSS
 st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
 
 
