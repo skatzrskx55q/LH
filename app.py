@@ -16,47 +16,42 @@ html, body, [class*="css"] {
 /* =========================================
    ИСПРАВЛЕНИЕ ШАПКИ И КНОПКИ САЙДБАРА
    ========================================= */
-/* Делаем сам контейнер шапки прозрачным и кликабельным насквозь */
-[data-testid="stHeader"] {
+/* 1. Делаем шапку прозрачной, чтобы она не перекрывала наш градиент */
+header[data-testid="stHeader"] {
     background: transparent !important;
     box-shadow: none !important;
-    pointer-events: none !important; /* Чтобы не перекрывать контент под шапкой */
 }
 
-/* Убираем ТОЛЬКО мусор справа (Deploy, Меню, Индикатор загрузки) */
+/* 2. Скрываем только мусор справа (Deploy, Меню разработчика, Индикаторы) */
 [data-testid="stToolbar"], 
-.stDeployButton, 
-[data-testid="stStatusWidget"] {
+[data-testid="stStatusWidget"], 
+.stDeployButton {
     display: none !important;
     visibility: hidden !important;
 }
 
-/* ФОРСИРУЕМ ОТОБРАЖЕНИЕ КНОПКИ САЙДБАРА (Стрелочки) */
-[data-testid="collapsedControl"] {
-    display: flex !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    pointer-events: auto !important; /* Возвращаем кликабельность кнопке */
-    z-index: 999999 !important; /* Вытаскиваем на самый верх */
-    
-    /* Стилизуем под дизайн */
-    color: #f4f4f5 !important;
-    background: rgba(24, 24, 27, 0.7) !important;
-    border: 1px solid rgba(139, 92, 246, 0.4) !important;
+/* 3. Красиво стилизуем стрелочку открытия сайдбара (оставляем родную логику Streamlit!) */
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapsedControl"] {
+    background-color: rgba(24, 24, 27, 0.6) !important;
     border-radius: 8px !important;
-    margin: 1rem !important;
+    border: 1px solid rgba(63, 63, 70, 0.4) !important;
+    color: #f4f4f5 !important;
     backdrop-filter: blur(8px) !important;
+    margin-top: 12px !important;
+    margin-left: 12px !important;
+    z-index: 999999 !important;
     transition: all 0.2s ease !important;
 }
 
-[data-testid="collapsedControl"]:hover {
-    color: #ffffff !important;
-    background: rgba(139, 92, 246, 0.4) !important;
+[data-testid="collapsedControl"]:hover,
+[data-testid="stSidebarCollapsedControl"]:hover {
+    background-color: rgba(139, 92, 246, 0.4) !important;
     border-color: #8b5cf6 !important;
-    box-shadow: 0 0 10px rgba(139, 92, 246, 0.3) !important;
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.2) !important;
 }
 
-/* Стилизуем крестик (закрытие) внутри самого сайдбара */
+/* Стилизуем крестик закрытия внутри самого сайдбара */
 [data-testid="stSidebarCollapseButton"] {
     color: #a1a1aa !important;
     transition: color 0.2s ease !important;
@@ -82,14 +77,14 @@ html, body, [class*="css"] {
 }
 
 .block-container {
-    padding-top: 3rem !important; /* Чуть увеличили отступ, чтобы кнопка не наезжала на заголовок */
+    padding-top: 3rem !important;
     padding-bottom: 4rem !important;
     max-width: 850px !important;
 }
 
 /* СТИЛИ SIDEBAR */
 [data-testid="stSidebar"] {
-    background-color: rgba(9, 9, 11, 0.8) !important;
+    background-color: rgba(9, 9, 11, 0.85) !important;
     border-right: 1px solid rgba(63, 63, 70, 0.4);
     backdrop-filter: blur(15px);
 }
