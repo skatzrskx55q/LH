@@ -2,8 +2,8 @@ import html
 import streamlit as st
 from utils import keyword_search, load_combined_data, semantic_search, decode_text_bytes
 
-# Настройка страницы всегда должна быть первой командой Streamlit
-st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="expanded")
+# Настройка страницы (Сайдбар теперь отключен по умолчанию)
+st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="collapsed")
 
 DARK_SaaS_CSS = """
 <style>
@@ -14,53 +14,16 @@ html, body, [class*="css"] {
 }
 
 /* =========================================
-   ИСПРАВЛЕНИЕ ШАПКИ И КНОПКИ САЙДБАРА
+   УНИЧТОЖАЕМ СТАНДАРТНУЮ ШАПКУ И САЙДБАР
    ========================================= */
-/* 1. Делаем шапку прозрачной, чтобы она не перекрывала наш градиент */
 header[data-testid="stHeader"] {
-    background: transparent !important;
-    box-shadow: none !important;
-}
-
-/* 2. Скрываем только мусор справа (Deploy, Меню разработчика, Индикаторы) */
-[data-testid="stToolbar"], 
-[data-testid="stStatusWidget"], 
-.stDeployButton {
     display: none !important;
-    visibility: hidden !important;
 }
-
-/* 3. Красиво стилизуем стрелочку открытия сайдбара (оставляем родную логику Streamlit!) */
-[data-testid="collapsedControl"],
+[data-testid="stSidebar"], 
+[data-testid="collapsedControl"], 
 [data-testid="stSidebarCollapsedControl"] {
-    background-color: rgba(24, 24, 27, 0.6) !important;
-    border-radius: 8px !important;
-    border: 1px solid rgba(63, 63, 70, 0.4) !important;
-    color: #f4f4f5 !important;
-    backdrop-filter: blur(8px) !important;
-    margin-top: 12px !important;
-    margin-left: 12px !important;
-    z-index: 999999 !important;
-    transition: all 0.2s ease !important;
+    display: none !important; /* Полностью вырезаем сайдбар и его стрелки */
 }
-
-[data-testid="collapsedControl"]:hover,
-[data-testid="stSidebarCollapsedControl"]:hover {
-    background-color: rgba(139, 92, 246, 0.4) !important;
-    border-color: #8b5cf6 !important;
-    box-shadow: 0 0 10px rgba(139, 92, 246, 0.2) !important;
-}
-
-/* Стилизуем крестик закрытия внутри самого сайдбара */
-[data-testid="stSidebarCollapseButton"] {
-    color: #a1a1aa !important;
-    transition: color 0.2s ease !important;
-}
-[data-testid="stSidebarCollapseButton"]:hover {
-    color: #8b5cf6 !important;
-}
-/* ========================================= */
-
 
 /* АНИМИРОВАННЫЙ ГРАДИЕНТНЫЙ ФОН ПРИЛОЖЕНИЯ */
 [data-testid="stAppViewContainer"] {
@@ -82,14 +45,30 @@ header[data-testid="stHeader"] {
     max-width: 850px !important;
 }
 
-/* СТИЛИ SIDEBAR */
-[data-testid="stSidebar"] {
-    background-color: rgba(9, 9, 11, 0.85) !important;
-    border-right: 1px solid rgba(63, 63, 70, 0.4);
-    backdrop-filter: blur(15px);
+/* =========================================
+   КАСТОМИЗАЦИЯ EXPANDER (НАСТРОЙКИ НАД ПОИСКОМ)
+   ========================================= */
+[data-testid="stExpander"] {
+    background: rgba(24, 24, 27, 0.45) !important;
+    border: 1px solid rgba(63, 63, 70, 0.4) !important;
+    border-radius: 16px !important;
+    backdrop-filter: blur(10px) !important;
+    margin-bottom: 2rem !important;
+    overflow: hidden;
 }
-[data-testid="stSidebar"] hr {
-    border-color: rgba(63, 63, 70, 0.3);
+[data-testid="stExpander"] summary {
+    background: transparent !important;
+    color: #f4f4f5 !important;
+    font-weight: 600 !important;
+    font-size: 15px !important;
+    padding: 16px 20px !important;
+    transition: color 0.2s ease;
+}
+[data-testid="stExpander"] summary:hover {
+    color: #8b5cf6 !important;
+}
+[data-testid="stExpander"] svg {
+    fill: currentColor !important;
 }
 
 /* КАСТОМИЗАЦИЯ ПОЛЕЙ ВВОДА */
@@ -97,7 +76,7 @@ div[data-baseweb="input"] > div,
 div[data-baseweb="base-input"],
 div[data-baseweb="textarea"] > div,
 div[data-baseweb="select"] > div {
-    background-color: rgba(24, 24, 27, 0.7) !important;
+    background-color: rgba(9, 9, 11, 0.6) !important;
     border: 1px solid rgba(63, 63, 70, 0.5) !important;
     border-radius: 12px !important;
     color: #f4f4f5 !important;
@@ -117,7 +96,7 @@ div[data-testid="stTextArea"] label p,
 div[data-testid="stFileUploader"] label p,
 div[data-testid="stRadio"] label p {
     color: #a1a1aa !important;
-    font-size: 13px !important;
+    font-size: 12px !important;
     font-weight: 600 !important;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -140,7 +119,6 @@ div[data-testid="stRadio"] label p {
     border: 1px solid rgba(63, 63, 70, 0.4);
     border-radius: 16px;
     backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
 }
 
 .stats-title {
@@ -173,7 +151,6 @@ div[data-testid="stRadio"] label p {
     position: relative;
     overflow: hidden;
     backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
 }
 
 .modern-card:hover {
@@ -328,12 +305,10 @@ def field_row(label, value, stacked: bool = False) -> str:
     lbl = escape(label)
     val = str(value or "-")
     
-    # ЕСЛИ ПРЕФИКСА НЕТ (просто сплошной текст)
     if not lbl:
         val_esc = escape(val)
         return f'<div class="data-row stacked"><div class="data-value"><pre>{val_esc}</pre></div></div>'
 
-    # МАГИЯ ДЛЯ ИНТЕНТОВ (со стрелочками)
     if "→" in val:
         parts = [p.strip() for p in val.split("→")]
         badges_html = "".join(
@@ -343,7 +318,6 @@ def field_row(label, value, stacked: bool = False) -> str:
         )
         return f'<div class="data-row stacked"><div class="data-label">{lbl}</div><div class="intent-container">{badges_html}</div></div>'
         
-    # ОБЫЧНОЕ ПОЛЕ (с префиксом)
     val_esc = escape(val)
     stacked_cls = " stacked" if stacked else ""
     return f'<div class="data-row{stacked_cls}"><div class="data-label">{lbl}</div><div class="data-value"><pre>{val_esc}</pre></div></div>'
@@ -366,7 +340,6 @@ def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
     for field in fields:
         val = field.get("value") or "-"
         lbl = field.get("label", "")
-        # Делаем поле stacked, если текст длинный, если это текст без префикса, или если есть переносы строк
         is_stacked = not lbl or (len(str(val)) > 80 and "→" not in str(val)) or "\n" in str(val)
         html_parts.append(field_row(lbl, val, stacked=is_stacked))
 
@@ -396,32 +369,42 @@ def render_results(title: str, items, total: int, show_scores: bool = False, ico
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
-# Внедряем глобальный кастомный CSS
+# Внедряем CSS
 st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
 
 
-# --- САЙДБАР: НАСТРОЙКИ ---
-with st.sidebar:
-    st.markdown("<h2 style='color: white; font-weight: 700;'>⚙️ Настройки базы</h2>", unsafe_allow_html=True)
-    st.markdown("---")
+# --- ЗАГОЛОВОК ---
+st.markdown("""
+<div style="text-align: center; margin-bottom: 2rem; padding-top: 1rem;">
+    <h1 style="font-size: 2.5rem; font-weight: 800; margin-bottom: 0.5rem; background: linear-gradient(to right, #ffffff, #a1a1aa); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+        Помощник Разметчика
+    </h1>
+    <p style="color: #a1a1aa; font-size: 1.1rem;">Интеллектуальный поиск по базе знаний</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# --- НАСТРОЙКИ (UX БЛОК НАД ПОИСКОМ) ---
+with st.expander("⚙️ Источники данных и настройки парсинга", expanded=False):
+    col_files, col_settings = st.columns([1.2, 1])
     
-    st.markdown("### 📁 Источники данных")
-    uploaded_files = st.file_uploader("Локальные .txt файлы", type="txt", accept_multiple_files=True)
-    
-    default_github = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
-    github_urls_text = st.text_area("Ссылки на GitHub (.txt)", value=default_github, help="Каждая ссылка с новой строки")
-    
-    st.markdown("---")
-    st.markdown("### 🏷 Чтение префиксов")
-    parse_choice = st.radio(
-        "Как обрабатывать данные?",
-        options=["Авто (любые слова с ':')", "Заданные вручную", "Сплошной текст (игнорировать)"],
-        index=0
-    )
-    
-    custom_prefixes_str = ""
-    if parse_choice == "Заданные вручную":
-        custom_prefixes_str = st.text_input("Укажите префиксы (через запятую)", value="Интенты, Дата, Статья, Ссылка")
+    with col_files:
+        st.markdown("<p style='color: white; font-weight: 600; margin-bottom: 8px;'>📁 Данные</p>", unsafe_allow_html=True)
+        uploaded_files = st.file_uploader("Локальные .txt файлы", type="txt", accept_multiple_files=True)
+        default_github = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
+        github_urls_text = st.text_area("Ссылки на GitHub (.txt)", value=default_github, height=100)
+        
+    with col_settings:
+        st.markdown("<p style='color: white; font-weight: 600; margin-bottom: 8px;'>🏷 Чтение префиксов</p>", unsafe_allow_html=True)
+        parse_choice = st.radio(
+            "Режим обработки:",
+            options=["Авто (любые слова с ':')", "Заданные вручную", "Сплошной текст (игнорировать)"],
+            index=0
+        )
+        
+        custom_prefixes_str = ""
+        if parse_choice == "Заданные вручную":
+            custom_prefixes_str = st.text_input("Укажите префиксы (через запятую)", value="Интенты, Дата, Статья, Ссылка")
 
 # Трансляция выбора интерфейса во внутренние флаги
 mode_map = {
@@ -439,18 +422,7 @@ def get_data(github_urls_str, files_data, mode, prefixes_str):
     return load_combined_data(urls, files_data, mode, prefixes)
 
 
-# --- ГЛАВНЫЙ ЭКРАН ---
-st.markdown("""
-<div style="text-align: center; margin-bottom: 3rem; padding-top: 1rem;">
-    <h1 style="font-size: 2.5rem; font-weight: 800; margin-bottom: 0.5rem; background: linear-gradient(to right, #ffffff, #a1a1aa); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
-        Помощник Разметчика
-    </h1>
-    <p style="color: #a1a1aa; font-size: 1.1rem;">Интеллектуальный поиск по базе знаний</p>
-</div>
-""", unsafe_allow_html=True)
-
-
-# Подготовка загруженных файлов для кэширования (переводим их в список кортежей (имя, текст))
+# Подготовка загруженных файлов
 processed_files = []
 if uploaded_files:
     for f in uploaded_files:
@@ -464,20 +436,22 @@ except Exception as exc:
     st.error(f"Сбой загрузки: {exc}")
     st.stop()
 
-if df.empty:
-    st.info("👋 **База знаний пуста.** Загрузите файлы в боковом меню слева или укажите ссылку на GitHub.")
-    st.stop()
 
-case_count = df["case_uid"].nunique()
-
+# --- ПОИСК ---
 query_col, top_k_col = st.columns([4, 1])
 with query_col:
     query = st.text_input("Поисковый запрос", placeholder="Введите текст, ошибку или ключевые слова...")
 with top_k_col:
     top_k = st.number_input("Выдача", min_value=1, max_value=20, value=5, step=1)
 
+if df.empty:
+    st.info("👋 **База знаний пуста.** Разверните настройки выше (⚙️ Источники данных), чтобы добавить файлы.")
+    st.stop()
+
 if not query.strip():
     st.stop()
+
+case_count = df["case_uid"].nunique()
 
 with st.spinner("Анализ данных..."):
     semantic_results = semantic_search(query, df, top_k=top_k)
