@@ -121,8 +121,8 @@ div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p
 .data-row.stacked { flex-direction: column; align-items: flex-start; gap: 6px; }
 .data-label { font-size: 12px; font-weight: 600; color: #a1a1aa; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
 .data-row:not(.stacked) .data-label::after { content: ":"; }
+
 .data-value { font-size: 14px; color: #e4e4e7; line-height: 1.6; word-break: break-word; width: 100%; }
-.data-value pre { white-space: pre-wrap; font-family: inherit; margin: 0; }
 
 .intent-container { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 2px; }
 .intent-badge { background: rgba(139, 92, 246, 0.15); border: 1px solid rgba(139, 92, 246, 0.3); color: #d8b4fe; padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 500; line-height: 1.4; }
@@ -134,14 +134,19 @@ div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p
 def escape(value) -> str:
     return html.escape(str(value or ""), quote=True)
 
+
 def field_row(label, value, stacked: bool = False) -> str:
     lbl = escape(label)
     val = str(value or "-")
     
+    # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Меняем системные переносы на HTML-теги <br>, 
+    # чтобы Markdown парсер Streamlit их не "съел"
+    val_html = escape(val).replace("\n", "<br>")
+    
     if not lbl:
-        val_esc = escape(val)
-        return f'<div class="data-row stacked"><div class="data-value"><pre>{val_esc}</pre></div></div>'
+        return f'<div class="data-row stacked"><div class="data-value">{val_html}</div></div>'
 
+    # МАГИЯ ДЛЯ ИНТЕНТОВ (со стрелочками)
     if "→" in val:
         parts = [p.strip() for p in val.split("→")]
         badges_html = "".join(
@@ -151,9 +156,9 @@ def field_row(label, value, stacked: bool = False) -> str:
         )
         return f'<div class="data-row stacked"><div class="data-label">{lbl}</div><div class="intent-container">{badges_html}</div></div>'
         
-    val_esc = escape(val)
     stacked_cls = " stacked" if stacked else ""
-    return f'<div class="data-row{stacked_cls}"><div class="data-label">{lbl}</div><div class="data-value"><pre>{val_esc}</pre></div></div>'
+    return f'<div class="data-row{stacked_cls}"><div class="data-label">{lbl}</div><div class="data-value">{val_html}</div></div>'
+
 
 def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
     fields = list(item.get("fields") or [])
@@ -172,6 +177,7 @@ def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
     for field in fields:
         val = field.get("value") or "-"
         lbl = field.get("label", "")
+        # Делаем поле stacked, если текст длинный, если это текст без префикса, или если есть переносы строк
         is_stacked = not lbl or (len(str(val)) > 80 and "→" not in str(val)) or "\n" in str(val)
         html_parts.append(field_row(lbl, val, stacked=is_stacked))
 
@@ -182,6 +188,7 @@ def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
 
     html_parts.append('</div>')
     return "".join(html_parts)
+
 
 def render_results(title: str, items, total: int, show_scores: bool = False, icon: str = "🔍") -> None:
     html_parts = [
@@ -246,7 +253,7 @@ with st.expander("⚙️ Источники данных и настройки �
     with col_upload:
         uploaded_files = st.file_uploader("📂 Локальные файлы (.txt)", type="txt", accept_multiple_files=True)
     with col_urls:
-        default_github = ""
+        default_github = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
         github_urls_text = st.text_area("🌐 Ссылки на GitHub (.txt)", value=default_github, height=100)
 
     # 1. Сбор всех доступных файлов
