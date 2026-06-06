@@ -87,6 +87,7 @@ div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin-bottom: 4px;
+    white-space: nowrap; /* Не даем лейблам переноситься на новую строку */
 }
 
 /* КОНТЕЙНЕР ПРИЛОЖЕНИЯ */
@@ -312,14 +313,15 @@ except Exception as exc:
     st.error(f"Ошибка обработки: {exc}")
     st.stop()
 
-# Обновленный блок с тремя колонками для раздельной настройки Top K
-query_col, top_k_sem_col, top_k_ex_col = st.columns([4, 1.2, 1.2])
+# КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Изменены пропорции колонок. 
+# Теперь поисковое поле занимает значительно больше места (6 частей против 1+1 для ползунков).
+query_col, top_k_sem_col, top_k_ex_col = st.columns([6, 1, 1])
 with query_col:
     query = st.text_input("Поисковый запрос", placeholder="Например: ошибка подключения...")
 with top_k_sem_col:
-    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для семантического поиска")
+    top_k_semantic = st.number_input("Топ (Умный)", min_value=1, max_value=20, value=5, step=1)
 with top_k_ex_col:
-    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1, help="Выдача для точного поиска")
+    top_k_exact = st.number_input("Топ (Точный)", min_value=1, max_value=20, value=5, step=1)
 
 if df.empty:
     st.warning("⚠️ База пуста или выбранные документы не содержат корректных данных для поиска (например, нет меток ==заголовок==).")
@@ -331,7 +333,6 @@ if not query.strip():
 case_count = df["case_uid"].nunique()
 
 with st.spinner("Анализ данных..."):
-    # Передаем раздельные переменные в функции поиска
     semantic_results = semantic_search(query, df, top_k=top_k_semantic)
     exact_results = keyword_search(query, df, top_k=top_k_exact)
 
