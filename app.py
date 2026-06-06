@@ -246,7 +246,7 @@ with st.expander("⚙️ Источники данных и настройки �
     with col_upload:
         uploaded_files = st.file_uploader("📂 Локальные файлы (.txt)", type="txt", accept_multiple_files=True)
     with col_urls:
-        default_github = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
+        default_github = ""
         github_urls_text = st.text_area("🌐 Ссылки на GitHub (.txt)", value=default_github, height=100)
 
     # 1. Сбор всех доступных файлов
