@@ -12,10 +12,45 @@ html, body, [class*="css"] {
     font-family: 'Inter', sans-serif !important;
 }
 
-header {display: none !important;}
+/* =========================================
+   ИСПРАВЛЕНИЕ САЙДБАРА И ХЕДЕРА
+   ========================================= */
+/* Делаем хедер прозрачным, но не удаляем его, чтобы кнопка сайдбара жила */
+header {
+    background-color: transparent !important;
+    box-shadow: none !important;
+}
+/* Прячем только мусорное меню Streamlit справа */
+[data-testid="stToolbar"], .stDeployButton {
+    display: none !important;
+}
 footer {display: none !important;}
-.stDeployButton {display: none !important;}
-div[data-testid="stToolbar"] {display: none !important;}
+
+/* Стилизуем кнопку открытия сайдбара (когда он свернут) */
+[data-testid="collapsedControl"] {
+    color: #a1a1aa !important;
+    background-color: rgba(24, 24, 27, 0.6) !important;
+    border: 1px solid rgba(63, 63, 70, 0.5) !important;
+    border-radius: 8px !important;
+    backdrop-filter: blur(8px) !important;
+    margin: 14px;
+    transition: all 0.2s ease;
+}
+[data-testid="collapsedControl"]:hover {
+    color: #ffffff !important;
+    background-color: rgba(139, 92, 246, 0.4) !important;
+    border-color: #8b5cf6 !important;
+}
+
+/* Стилизуем кнопку закрытия внутри самого сайдбара */
+[data-testid="stSidebarCollapseButton"] {
+    color: #a1a1aa !important;
+    transition: all 0.2s ease;
+}
+[data-testid="stSidebarCollapseButton"]:hover {
+    color: #8b5cf6 !important;
+}
+
 
 /* АНИМИРОВАННЫЙ ГРАДИЕНТНЫЙ ФОН ПРИЛОЖЕНИЯ */
 [data-testid="stAppViewContainer"] {
@@ -218,7 +253,6 @@ div[data-testid="stRadio"] label p {
     white-space: nowrap;
 }
 
-/* Добавляем двоеточие для полей в одну строку */
 .data-row:not(.stacked) .data-label::after {
     content: ":";
 }
@@ -237,7 +271,6 @@ div[data-testid="stRadio"] label p {
     margin: 0;
 }
 
-/* СТИЛИ ДЛЯ ИНТЕНТОВ (БЕЙДЖИ) */
 .intent-container {
     display: flex;
     flex-wrap: wrap;
