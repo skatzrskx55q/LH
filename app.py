@@ -1,8 +1,8 @@
 import html
 import streamlit as st
-from utils import keyword_search, load_all_txts, semantic_search
+from utils import keyword_search, load_combined_data, semantic_search, decode_text_bytes
 
-st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡")
+st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="expanded")
 
 DARK_SaaS_CSS = """
 <style>
@@ -37,9 +37,21 @@ div[data-testid="stToolbar"] {display: none !important;}
     max-width: 850px !important;
 }
 
+/* СТИЛИ SIDEBAR */
+[data-testid="stSidebar"] {
+    background-color: rgba(9, 9, 11, 0.8) !important;
+    border-right: 1px solid rgba(63, 63, 70, 0.4);
+    backdrop-filter: blur(15px);
+}
+[data-testid="stSidebar"] hr {
+    border-color: rgba(63, 63, 70, 0.3);
+}
+
 /* КАСТОМИЗАЦИЯ ПОЛЕЙ ВВОДА */
 div[data-baseweb="input"] > div, 
-div[data-baseweb="base-input"] {
+div[data-baseweb="base-input"],
+div[data-baseweb="textarea"] > div,
+div[data-baseweb="select"] > div {
     background-color: rgba(24, 24, 27, 0.7) !important;
     border: 1px solid rgba(63, 63, 70, 0.5) !important;
     border-radius: 12px !important;
@@ -47,14 +59,18 @@ div[data-baseweb="base-input"] {
     backdrop-filter: blur(8px);
 }
 
-div[data-baseweb="input"] > div:focus-within {
+div[data-baseweb="input"] > div:focus-within,
+div[data-baseweb="textarea"] > div:focus-within {
     border-color: #8b5cf6 !important;
     box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.25) !important;
     background-color: rgba(9, 9, 11, 0.8) !important;
 }
 
 div[data-testid="stTextInput"] label p, 
-div[data-testid="stNumberInput"] label p {
+div[data-testid="stNumberInput"] label p,
+div[data-testid="stTextArea"] label p,
+div[data-testid="stFileUploader"] label p,
+div[data-testid="stRadio"] label p {
     color: #a1a1aa !important;
     font-size: 13px !important;
     font-weight: 600 !important;
@@ -169,7 +185,6 @@ div[data-testid="stNumberInput"] label p {
     flex: 1;
 }
 
-/* СЕТКА ДАННЫХ И КОМПАКТНЫЕ ОТСТУПЫ */
 .data-grid {
     display: flex;
     flex-direction: column;
@@ -185,7 +200,7 @@ div[data-testid="stNumberInput"] label p {
     flex-direction: row;
     gap: 8px;
     align-items: baseline;
-    flex-wrap: wrap; /* Позволяет переносить длинный текст */
+    flex-wrap: wrap;
 }
 
 .data-row.stacked {
@@ -200,10 +215,10 @@ div[data-testid="stNumberInput"] label p {
     color: #a1a1aa;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    white-space: nowrap; /* Лейбл не рвется на части */
+    white-space: nowrap;
 }
 
-/* Добавляем двоеточие для полей в одну строку (например: Дата: 19.09.25) */
+/* Добавляем двоеточие для полей в одну строку */
 .data-row:not(.stacked) .data-label::after {
     content: ":";
 }
@@ -213,6 +228,7 @@ div[data-testid="stNumberInput"] label p {
     color: #e4e4e7;
     line-height: 1.6;
     word-break: break-word;
+    width: 100%;
 }
 
 .data-value pre {
@@ -269,19 +285,22 @@ def field_row(label, value, stacked: bool = False) -> str:
     lbl = escape(label)
     val = str(value or "-")
     
-    # МАГИЯ ДЛЯ ИНТЕНТОВ: Если в тексте есть стрелочка, парсим это в красивые бейджи
+    # ЕСЛИ ПРЕФИКСА НЕТ (просто сплошной текст)
+    if not lbl:
+        val_esc = escape(val)
+        return f'<div class="data-row stacked"><div class="data-value"><pre>{val_esc}</pre></div></div>'
+
+    # МАГИЯ ДЛЯ ИНТЕНТОВ (со стрелочками)
     if "→" in val:
         parts = [p.strip() for p in val.split("→")]
-        # Генерируем бейджи в один цикл
         badges_html = "".join(
             f'<div class="intent-badge">{escape(part)}</div><div class="intent-arrow">→</div>' 
             if i < len(parts) - 1 else f'<div class="intent-badge">{escape(part)}</div>' 
             for i, part in enumerate(parts)
         )
-        # Интенты всегда делаем колонкой (stacked), чтобы бейджам было просторно
         return f'<div class="data-row stacked"><div class="data-label">{lbl}</div><div class="intent-container">{badges_html}</div></div>'
         
-    # Обычное поле (например, "Дата: 19.09.2025")
+    # ОБЫЧНОЕ ПОЛЕ (с префиксом)
     val_esc = escape(val)
     stacked_cls = " stacked" if stacked else ""
     return f'<div class="data-row{stacked_cls}"><div class="data-label">{lbl}</div><div class="data-value"><pre>{val_esc}</pre></div></div>'
@@ -303,9 +322,10 @@ def render_card(item, rank: int, show_score: bool, is_best: bool) -> str:
 
     for field in fields:
         val = field.get("value") or "-"
-        # Ставим флаг stacked, только если текст реально длинный и в нем нет стрелочек (стрелочки обрабатываются отдельно)
-        is_stacked = (len(str(val)) > 80 and "→" not in str(val)) or "\n" in str(val)
-        html_parts.append(field_row(field.get("label", "Поле"), val, stacked=is_stacked))
+        lbl = field.get("label", "")
+        # Делаем поле stacked, если текст длинный, если это текст без префикса, или если есть переносы строк
+        is_stacked = not lbl or (len(str(val)) > 80 and "→" not in str(val)) or "\n" in str(val)
+        html_parts.append(field_row(lbl, val, stacked=is_stacked))
 
     html_parts.append('</div>')
 
@@ -323,7 +343,7 @@ def render_results(title: str, items, total: int, show_scores: bool = False, ico
     ]
 
     if not items:
-        html_parts.append('<div class="modern-card" style="text-align:center; color:#a1a1aa; padding: 40px;">Нет данных по вашему запросу.</div>')
+        html_parts.append('<div class="modern-card" style="text-align:center; color:#a1a1aa; padding: 40px;">Ничего не найдено. Попробуйте другой запрос.</div>')
     else:
         for idx, item in enumerate(items):
             is_best = (show_scores and idx == 0)
@@ -335,10 +355,47 @@ def render_results(title: str, items, total: int, show_scores: bool = False, ico
 
 st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
 
-@st.cache_data(show_spinner=False)
-def get_data():
-    return load_all_txts()
 
+# --- САЙДБАР: НАСТРОЙКИ ---
+with st.sidebar:
+    st.markdown("<h2 style='color: white; font-weight: 700;'>⚙️ Настройки базы</h2>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    st.markdown("### 📁 Источники данных")
+    uploaded_files = st.file_uploader("Локальные .txt файлы", type="txt", accept_multiple_files=True)
+    
+    default_github = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
+    github_urls_text = st.text_area("Ссылки на GitHub (.txt)", value=default_github, help="Каждая ссылка с новой строки")
+    
+    st.markdown("---")
+    st.markdown("### 🏷 Чтение префиксов")
+    parse_choice = st.radio(
+        "Как обрабатывать данные?",
+        options=["Авто (любые слова с ':')", "Заданные вручную", "Сплошной текст (игнорировать)"],
+        index=0
+    )
+    
+    custom_prefixes_str = ""
+    if parse_choice == "Заданные вручную":
+        custom_prefixes_str = st.text_input("Укажите префиксы (через запятую)", value="Интенты, Дата, Статья, Ссылка")
+
+# Трансляция выбора интерфейса во внутренние флаги
+mode_map = {
+    "Авто (любые слова с ':')": "auto",
+    "Заданные вручную": "custom",
+    "Сплошной текст (игнорировать)": "none"
+}
+parse_mode = mode_map[parse_choice]
+
+
+@st.cache_data(show_spinner=False)
+def get_data(github_urls_str, files_data, mode, prefixes_str):
+    urls = [u.strip() for u in github_urls_str.split("\n") if u.strip()]
+    prefixes = [p.strip() for p in prefixes_str.split(",")] if prefixes_str else []
+    return load_combined_data(urls, files_data, mode, prefixes)
+
+
+# --- ГЛАВНЫЙ ЭКРАН ---
 st.markdown("""
 <div style="text-align: center; margin-bottom: 3rem; padding-top: 1rem;">
     <h1 style="font-size: 2.5rem; font-weight: 800; margin-bottom: 0.5rem; background: linear-gradient(to right, #ffffff, #a1a1aa); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
@@ -348,11 +405,23 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+
+# Подготовка загруженных файлов для кэширования (переводим их в список кортежей (имя, текст))
+processed_files = []
+if uploaded_files:
+    for f in uploaded_files:
+        processed_files.append((f.name, decode_text_bytes(f.getvalue())))
+
+
 try:
     with st.spinner("Синхронизация с базой..."):
-        df = get_data()
+        df = get_data(github_urls_text, processed_files, parse_mode, custom_prefixes_str)
 except Exception as exc:
     st.error(f"Сбой загрузки: {exc}")
+    st.stop()
+
+if df.empty:
+    st.info("👋 **База знаний пуста.** Загрузите файлы в боковом меню слева или укажите ссылку на GitHub.")
     st.stop()
 
 case_count = df["case_uid"].nunique()
