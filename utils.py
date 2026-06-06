@@ -6,40 +6,29 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import requests
 
-
 MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
-GITHUB_TXT_URLS: List[str] = [
-    "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt",
-]
 REQUEST_TIMEOUT_SECONDS = 30
 
 CASE_MARKER_RE = re.compile(r"==\s*(?P<title>.*?)\s*==", re.DOTALL)
 SERVICE_FIELD_RE = re.compile(r"^\s*(?P<label>[^:\n]{1,80})\s*:\s*(?P<value>.*)$")
 
-
 @functools.lru_cache(maxsize=1)
 def get_model():
     from sentence_transformers import SentenceTransformer
-
     return SentenceTransformer(MODEL_ID)
-
 
 @functools.lru_cache(maxsize=1)
 def get_morph():
     try:
         import pymorphy3
-
         return pymorphy3.MorphAnalyzer()
     except Exception:
         pass
-
     try:
         import pymorphy2
-
         return pymorphy2.MorphAnalyzer()
     except Exception:
         return None
-
 
 def decode_text_bytes(content: bytes) -> str:
     for encoding in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
@@ -49,14 +38,11 @@ def decode_text_bytes(content: bytes) -> str:
             continue
     return content.decode("utf-8", errors="replace")
 
-
 def normalize_spaces(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
-
 def preprocess(text: Any) -> str:
     return normalize_spaces(text).lower()
-
 
 def lemmatize(word: str) -> str:
     morph = get_morph()
@@ -64,11 +50,9 @@ def lemmatize(word: str) -> str:
         return word
     return morph.parse(word)[0].normal_form
 
-
 @functools.lru_cache(maxsize=10000)
 def lemmatize_cached(word: str) -> str:
     return lemmatize(word)
-
 
 def split_by_slash(phrase: str) -> List[str]:
     phrase = normalize_spaces(phrase)
@@ -108,8 +92,11 @@ def split_by_slash(phrase: str) -> List[str]:
 
     return list(dict.fromkeys(variants))
 
+def parse_service_fields(tail: str, parse_mode: str = "auto", custom_prefixes: List[str] = None) -> List[Dict[str, str]]:
+    # Если парсинг отключен, возвращаем весь блок как единый текст без префикса
+    if parse_mode == "none":
+        return [{"label": "", "value": tail.strip()}]
 
-def parse_service_fields(tail: str) -> List[Dict[str, str]]:
     lines = [line.rstrip() for line in normalize_line_endings(tail).split("\n")]
     fields: List[Dict[str, str]] = []
     label = ""
@@ -129,7 +116,18 @@ def parse_service_fields(tail: str) -> List[Dict[str, str]]:
             continue
 
         match = SERVICE_FIELD_RE.match(line)
+        is_valid_prefix = False
+
         if match:
+            lbl_candidate = normalize_spaces(match.group("label"))
+            # Проверяем, подходит ли найденный префикс под выбранный режим
+            if parse_mode == "auto":
+                is_valid_prefix = True
+            elif parse_mode == "custom" and custom_prefixes:
+                if lbl_candidate.lower() in [p.lower() for p in custom_prefixes]:
+                    is_valid_prefix = True
+
+        if is_valid_prefix:
             flush()
             label = normalize_spaces(match.group("label"))
             value = match.group("value").strip()
@@ -144,16 +142,15 @@ def parse_service_fields(tail: str) -> List[Dict[str, str]]:
     flush()
 
     if preamble:
-        fields.insert(0, {"label": "Описание", "value": "\n".join(preamble).strip()})
+        # Preamble - это текст, который идет ДО первого найденного префикса (или если префиксов нет вообще)
+        fields.insert(0, {"label": "", "value": "\n".join(preamble).strip()})
 
     return [field for field in fields if field["label"] or field["value"]]
-
 
 def normalize_line_endings(text: Any) -> str:
     return str(text or "").replace("\r\n", "\n").replace("\r", "\n")
 
-
-def parse_txt_cases(text: str, source_name: str = "document.txt") -> List[Dict[str, Any]]:
+def parse_txt_cases(text: str, source_name: str = "document.txt", parse_mode: str = "auto", custom_prefixes: List[str] = None) -> List[Dict[str, Any]]:
     text = normalize_line_endings(text)
     markers = list(CASE_MARKER_RE.finditer(text))
     cases: List[Dict[str, Any]] = []
@@ -165,7 +162,7 @@ def parse_txt_cases(text: str, source_name: str = "document.txt") -> List[Dict[s
 
         next_start = markers[index].start() if index < len(markers) else len(text)
         tail = text[marker.end():next_start].strip()
-        fields = parse_service_fields(tail)
+        fields = parse_service_fields(tail, parse_mode, custom_prefixes)
         variants = split_by_slash(title) or [title]
 
         for variant_index, variant in enumerate(variants, start=1):
@@ -187,66 +184,38 @@ def parse_txt_cases(text: str, source_name: str = "document.txt") -> List[Dict[s
 
     return cases
 
-
-def load_text_documents(documents: Sequence[Tuple[str, str]]) -> pd.DataFrame:
-    records: List[Dict[str, Any]] = []
-
-    for source_name, text in documents:
-        records.extend(parse_txt_cases(text, source_name=source_name))
-
-    if not records:
-        raise ValueError("В TXT-документах не найдено кейсов формата ==текст для поиска==.")
-
-    df = pd.DataFrame(records)
-    model = get_model()
-    df.attrs["phrase_embs"] = model.encode(df["search_proc"].tolist(), convert_to_tensor=True)
-    return df
-
-
-def load_txt(url: str) -> pd.DataFrame:
-    response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-    if response.status_code != 200:
-        raise ValueError(f"Ошибка загрузки {url}: HTTP {response.status_code}")
-
-    source_name = url.rstrip("/").split("/")[-1] or "github.txt"
-    records = parse_txt_cases(decode_text_bytes(response.content), source_name=source_name)
-    if not records:
-        raise ValueError(f"В файле {source_name} не найдено кейсов формата ==текст для поиска==.")
-
-    return pd.DataFrame(records)
-
-
-def load_all_txts() -> pd.DataFrame:
+def load_combined_data(github_urls: List[str], uploaded_files: List[Tuple[str, str]], parse_mode: str, custom_prefixes: List[str]) -> pd.DataFrame:
+    """Универсальный загрузчик: обрабатывает и ссылки, и локальные файлы разом."""
     dfs = []
-    for url in GITHUB_TXT_URLS:
+    
+    # Загрузка по ссылкам
+    for url in github_urls:
+        if not url.strip():
+            continue
         try:
-            dfs.append(load_txt(url))
+            response = requests.get(url.strip(), timeout=REQUEST_TIMEOUT_SECONDS)
+            if response.status_code == 200:
+                source_name = url.rstrip("/").split("/")[-1] or "github.txt"
+                content = decode_text_bytes(response.content)
+                records = parse_txt_cases(content, source_name, parse_mode, custom_prefixes)
+                if records:
+                    dfs.append(pd.DataFrame(records))
         except Exception as exc:
-            print(f"Ошибка с {url}: {exc}")
+            print(f"Ошибка загрузки {url}: {exc}")
+
+    # Обработка загруженных файлов
+    for source_name, text_content in uploaded_files:
+        records = parse_txt_cases(text_content, source_name, parse_mode, custom_prefixes)
+        if records:
+            dfs.append(pd.DataFrame(records))
 
     if not dfs:
-        raise ValueError("Не удалось загрузить ни одного TXT-файла")
+        return pd.DataFrame() # Возвращаем пустой DF, если данных нет
 
     df = pd.concat(dfs, ignore_index=True)
-
     model = get_model()
     df.attrs["phrase_embs"] = model.encode(df["search_proc"].tolist(), convert_to_tensor=True)
-
     return df
-
-
-def load_github_text_documents(urls: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    if urls is None:
-        return load_all_txts()
-    documents = []
-    for url in urls:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-        if response.status_code != 200:
-            raise ValueError(f"Ошибка загрузки {url}: HTTP {response.status_code}")
-        source_name = url.rstrip("/").split("/")[-1] or "github.txt"
-        documents.append((source_name, decode_text_bytes(response.content)))
-    return load_text_documents(documents)
-
 
 def _result_from_row(row: pd.Series, score: Optional[float] = None) -> Dict[str, Any]:
     result = {
@@ -261,7 +230,6 @@ def _result_from_row(row: pd.Series, score: Optional[float] = None) -> Dict[str,
         result["score"] = float(score)
     return result
 
-
 def deduplicate_results(results: Iterable[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
     best_by_case: Dict[str, Dict[str, Any]] = {}
 
@@ -275,13 +243,11 @@ def deduplicate_results(results: Iterable[Dict[str, Any]], top_k: int) -> List[D
     ordered = sorted(best_by_case.values(), key=lambda item: item.get("score", 1.0), reverse=True)
     return ordered[:top_k]
 
-
 def semantic_search(query: str, df: pd.DataFrame, top_k: int = 5, threshold: float = 0.5) -> List[Dict[str, Any]]:
-    if df.empty:
+    if df.empty or "phrase_embs" not in df.attrs:
         return []
 
     from sentence_transformers import util
-
     model = get_model()
     query_emb = model.encode(preprocess(query), convert_to_tensor=True)
     sims = util.pytorch_cos_sim(query_emb, df.attrs["phrase_embs"])[0]
@@ -293,8 +259,10 @@ def semantic_search(query: str, df: pd.DataFrame, top_k: int = 5, threshold: flo
     )
     return deduplicate_results(ranked, top_k=top_k)
 
-
 def keyword_search(query: str, df: pd.DataFrame, top_k: int = 5) -> List[Dict[str, Any]]:
+    if df.empty:
+        return []
+        
     query_proc = preprocess(query)
     query_words = re.findall(r"\w+", query_proc)
     if not query_words:
