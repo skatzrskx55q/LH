@@ -38,6 +38,16 @@ def decode_text_bytes(content: bytes) -> str:
             continue
     return content.decode("utf-8", errors="replace")
 
+def fetch_url_text(url: str) -> Optional[str]:
+    """Безопасно скачивает текст по ссылке."""
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        return decode_text_bytes(response.content)
+    except Exception as exc:
+        print(f"Ошибка загрузки {url}: {exc}")
+        return None
+
 def normalize_spaces(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -93,7 +103,6 @@ def split_by_slash(phrase: str) -> List[str]:
     return list(dict.fromkeys(variants))
 
 def parse_service_fields(tail: str, parse_mode: str = "auto", custom_prefixes: List[str] = None) -> List[Dict[str, str]]:
-    # Если парсинг отключен, возвращаем весь блок как единый текст без префикса
     if parse_mode == "none":
         return [{"label": "", "value": tail.strip()}]
 
@@ -120,7 +129,6 @@ def parse_service_fields(tail: str, parse_mode: str = "auto", custom_prefixes: L
 
         if match:
             lbl_candidate = normalize_spaces(match.group("label"))
-            # Проверяем, подходит ли найденный префикс под выбранный режим
             if parse_mode == "auto":
                 is_valid_prefix = True
             elif parse_mode == "custom" and custom_prefixes:
@@ -142,7 +150,6 @@ def parse_service_fields(tail: str, parse_mode: str = "auto", custom_prefixes: L
     flush()
 
     if preamble:
-        # Preamble - это текст, который идет ДО первого найденного префикса (или если префиксов нет вообще)
         fields.insert(0, {"label": "", "value": "\n".join(preamble).strip()})
 
     return [field for field in fields if field["label"] or field["value"]]
@@ -183,39 +190,6 @@ def parse_txt_cases(text: str, source_name: str = "document.txt", parse_mode: st
             )
 
     return cases
-
-def load_combined_data(github_urls: List[str], uploaded_files: List[Tuple[str, str]], parse_mode: str, custom_prefixes: List[str]) -> pd.DataFrame:
-    """Универсальный загрузчик: обрабатывает и ссылки, и локальные файлы разом."""
-    dfs = []
-    
-    # Загрузка по ссылкам
-    for url in github_urls:
-        if not url.strip():
-            continue
-        try:
-            response = requests.get(url.strip(), timeout=REQUEST_TIMEOUT_SECONDS)
-            if response.status_code == 200:
-                source_name = url.rstrip("/").split("/")[-1] or "github.txt"
-                content = decode_text_bytes(response.content)
-                records = parse_txt_cases(content, source_name, parse_mode, custom_prefixes)
-                if records:
-                    dfs.append(pd.DataFrame(records))
-        except Exception as exc:
-            print(f"Ошибка загрузки {url}: {exc}")
-
-    # Обработка загруженных файлов
-    for source_name, text_content in uploaded_files:
-        records = parse_txt_cases(text_content, source_name, parse_mode, custom_prefixes)
-        if records:
-            dfs.append(pd.DataFrame(records))
-
-    if not dfs:
-        return pd.DataFrame() # Возвращаем пустой DF, если данных нет
-
-    df = pd.concat(dfs, ignore_index=True)
-    model = get_model()
-    df.attrs["phrase_embs"] = model.encode(df["search_proc"].tolist(), convert_to_tensor=True)
-    return df
 
 def _result_from_row(row: pd.Series, score: Optional[float] = None) -> Dict[str, Any]:
     result = {
