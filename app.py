@@ -121,7 +121,7 @@ div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p
 .data-row { display: flex; flex-direction: row; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .data-row.stacked { flex-direction: column; align-items: flex-start; gap: 6px; }
 .data-label { font-size: 12px; font-weight: 600; color: #a1a1aa; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
-.data-row:not(.stacked) .data-label::after { content: ":"; }
+.data-label::after { content: ":"; }
 
 .data-value { font-size: 14px; color: #e4e4e7; line-height: 1.6; word-break: break-word; width: 100%; }
 
