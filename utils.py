@@ -94,3 +94,303 @@ def validate_source_url(url):
     if not safe_http_url(url):
         raise ValueError("Некорректный URL источника.")
     parts = urlsplit(url)
+    if (parts.scheme != "https" or parts.hostname != "raw.githubusercontent.com"
+            or parts.port not in (None, 443)):
+        raise ValueError("Источники разрешены только с https://raw.githubusercontent.com.")
+    if len([part for part in parts.path.split("/") if part]) < 4:
+        raise ValueError("Укажите прямую ссылку на файл GitHub: владелец/репозиторий/ветка/файл.")
+    return urlunsplit(("https", "raw.githubusercontent.com", parts.path, parts.query, ""))
+
+
+def fetch_url_text(url):
+    """Allowlist проверяется заново на каждом перенаправлении; ошибки идут в UI."""
+    import requests
+    url = validate_source_url(url)
+    with requests.Session() as session:
+        session.trust_env = False
+        for _ in range(4):
+            with session.get(url, timeout=(5, REQUEST_TIMEOUT_SECONDS),
+                             allow_redirects=False, stream=True) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise ValueError("Перенаправление без адреса.")
+                    url = validate_source_url(urljoin(url, location))
+                    continue
+                response.raise_for_status()
+                size = 0
+                chunks = []
+                for chunk in response.iter_content(chunk_size=65536):
+                    size += len(chunk)
+                    if size > MAX_DOCUMENT_BYTES:
+                        raise ValueError("Размер документа превышает 5 МБ.")
+                    chunks.append(chunk)
+                return decode_text_bytes(b"".join(chunks))
+    raise ValueError("Слишком много перенаправлений.")
+
+
+def split_by_slash(phrase):
+    phrase = normalize_spaces(phrase)
+    variants = []
+    for segment in phrase.split("|"):
+        segment = segment.strip()
+        if not segment:
+            continue
+        # URL внутри заголовка не является набором альтернатив.
+        urls = [(m.start(), m.end()) for m in re.finditer(r"https?://\S+", segment)]
+        parts = []
+        last = 0
+        for match in re.finditer(r"\b[\w-]+(?:/[\w-]+)+\b", segment):
+            if any(a <= match.start() < b for a, b in urls):
+                continue
+            parts.extend([[segment[last:match.start()]], match.group().split("/")])
+            last = match.end()
+        parts.append([segment[last:]])
+        for combo in islice(product(*parts), MAX_VARIANTS + 1):
+            variant = normalize_spaces("".join(combo))
+            if variant and variant not in variants:
+                variants.append(variant)
+                if len(variants) > MAX_VARIANTS:
+                    raise ValueError(f"Больше {MAX_VARIANTS} вариантов в одном заголовке; разделите кейс.")
+    return variants
+
+
+def parse_service_fields(tail, parse_mode="auto", custom_prefixes=None):
+    if parse_mode not in {"auto", "custom", "none"}:
+        raise ValueError("Неизвестный режим парсинга.")
+    if parse_mode == "none":
+        return [{"label": "", "value": tail.strip()}] if tail.strip() else []
+    prefixes = {normalize_spaces(p).rstrip(":").casefold() for p in (custom_prefixes or [])}
+    fields, preamble, values = [], [], []
+    label = ""
+
+    def flush():
+        nonlocal label, values
+        if label:
+            fields.append({"label": label, "value": "\n".join(values).strip()})
+        label, values = "", []
+
+    for raw_line in normalize_line_endings(tail).split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # URL никогда не попадает в универсальный шаблон label: value.
+        if re.match(r"https?://", line, re.I):
+            if parse_mode == "auto" and safe_http_url(line):
+                flush()
+                fields.append({"label": "Ссылка", "value": line})
+            elif label:
+                values.append(line)
+            else:
+                preamble.append(line)
+            continue
+        match = SERVICE_FIELD_RE.match(line)
+        candidate = normalize_spaces(match.group("label")) if match else ""
+        if match and (parse_mode == "auto" or candidate.casefold() in prefixes):
+            flush()
+            label = candidate
+            values = [match.group("value").strip()]
+        elif label:
+            values.append(line)
+        else:
+            preamble.append(line)
+    flush()
+    if preamble:
+        fields.insert(0, {"label": "", "value": "\n".join(preamble)})
+    return fields
+
+
+def parse_txt_cases(text, source_name="document.txt", parse_mode="auto", custom_prefixes=None,
+                    source_id=None):
+    text = normalize_line_endings(text)
+    markers = list(CASE_MARKER_RE.finditer(text))
+    cases = []
+    source_id = source_id or source_name
+    for offset, marker in enumerate(markers):
+        index = offset + 1
+        title = normalize_spaces(marker.group("title"))
+        if not title:
+            continue
+        end = markers[offset + 1].start() if offset + 1 < len(markers) else len(text)
+        tail = text[marker.end():end].strip()
+        fields = parse_service_fields(tail, parse_mode, custom_prefixes)
+        for vi, variant in enumerate(split_by_slash(title), 1):
+            cases.append({"case_uid": f"{source_id}::{index}",
+                          "variant_uid": f"{source_id}::{index}::{vi}",
+                          "source_file": source_name, "case_index": index,
+                          "title": title, "search_text": variant, "search_proc": preprocess(variant),
+                          "search_lemmas": set(map(lemmatize_cached, tokenize(variant))),
+                          "fields": fields, "raw_tail": tail})
+    return cases
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def build_database(doc_configs, scope="case"):
+    if scope not in {"title", "case"}:
+        raise ValueError("Неизвестная область поиска.")
+    rows = []
+    source_ids = set()
+    for cfg in doc_configs:
+        sid = cfg.get("source_id", cfg["name"])
+        if sid in source_ids:
+            raise ValueError("Источники должны иметь разные идентификаторы.")
+        source_ids.add(sid)
+        rows.extend(parse_txt_cases(cfg["text"], cfg["name"], cfg.get("mode", "auto"),
+                                    cfg.get("prefixes", []), sid))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    texts = tuple(row["search_text"] + ("\n" + row["raw_tail"] if scope == "case" else "") for row in rows)
+    tokens = tuple(tokenize(text) for text in texts)
+    lemmas = tuple(tuple(map(lemmatize_cached, words)) for words in tokens)
+    postings, lemma_postings = defaultdict(set), defaultdict(set)
+    for i, (words, norms) in enumerate(zip(tokens, lemmas)):
+        for word in set(words):
+            postings[word].add(i)
+        for word in set(norms):
+            lemma_postings[word].add(i)
+    df.attrs.update(scope=scope, indexed_texts=texts, tokens=tokens, lemmas=lemmas,
+                    postings=dict(postings), lemma_postings=dict(lemma_postings))
+    return df
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_embeddings(texts, model_id=MODEL_ID):
+    """Ключ — тексты, а не параметры отображения. Длинные кейсы режутся по токенам."""
+    with model_lock():
+        model = get_model(model_id)
+        max_tokens = max(8, int(model.max_seq_length) - model.tokenizer.num_special_tokens_to_add(pair=False))
+        overlap = min(32, max_tokens // 4)
+        chunks, owners = [], []
+        for i, text in enumerate(texts):
+            ids = model.tokenizer.encode(text, add_special_tokens=False)
+            for start in range(0, max(1, len(ids)), max_tokens - overlap):
+                chunks.append(model.tokenizer.decode(ids[start:start + max_tokens], skip_special_tokens=True))
+                owners.append(i)
+                if start + max_tokens >= len(ids):
+                    break
+        matrix = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True,
+                              batch_size=32, show_progress_bar=False)
+        return np.asarray(matrix, dtype=np.float32), np.asarray(owners, dtype=np.int64)
+
+
+def attach_embeddings(df, model_id=MODEL_ID):
+    if not df.empty:
+        matrix, owners = cached_embeddings(df.attrs["indexed_texts"], model_id)
+        df.attrs.update(phrase_embs=matrix, embedding_owners=owners, model_id=model_id)
+    return df
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def encode_query(query, model_id=MODEL_ID):
+    with model_lock():
+        return np.asarray(get_model(model_id).encode(normalize_spaces(query), convert_to_numpy=True,
+                          normalize_embeddings=True, show_progress_bar=False), dtype=np.float32)
+
+
+def semantic_scores(query, df):
+    if df.empty or not tokenize(query) or "phrase_embs" not in df.attrs:
+        return None
+    vector = encode_query(query, df.attrs.get("model_id", MODEL_ID))
+    scores = np.clip(df.attrs["phrase_embs"] @ vector.reshape(-1), -1.0, 1.0)
+    result = np.full(len(df), -1.0, dtype=np.float32)
+    np.maximum.at(result, df.attrs.get("embedding_owners", np.arange(len(df))), scores)
+    return result
+
+
+def _result_from_row(row, score=None, **details):
+    result = {key: row[key] for key in ("case_uid", "source_file", "case_index", "title", "fields", "search_text")}
+    result["case_index"] = int(result["case_index"])
+    if score is not None:
+        result["score"] = float(score)
+    result.update(details)
+    return result
+
+
+def deduplicate_results(results, top_k):
+    best = {}
+    for item in results:
+        prev = best.get(item["case_uid"])
+        if prev is None or item.get("score", 1) > prev.get("score", 1):
+            best[item["case_uid"]] = item
+    return sorted(best.values(), key=lambda item: (-item.get("score", 1), item["case_uid"]))[:max(0, top_k)]
+
+
+def _contains_phrase(words, query_words):
+    return any(words[start:start + len(query_words)] == query_words
+               for start in range(len(words) - len(query_words) + 1))
+
+
+def lexical_scores(query, df, allow_substring=False):
+    result = np.zeros(len(df), dtype=np.float32)
+    kinds = {}
+    words = tokenize(query)
+    if not words or df.empty:
+        return result, kinds
+    norms = tuple(map(lemmatize_cached, words))
+    attrs = df.attrs
+    # Совместимость с DataFrame, построенным старым способом.
+    if "tokens" not in attrs:
+        texts = tuple(df["search_proc"])
+        tokens = tuple(map(tokenize, texts))
+        lemmas = tuple(tuple(map(lemmatize_cached, t)) for t in tokens)
+        candidates = set(range(len(df)))
+    else:
+        tokens, lemmas = attrs["tokens"], attrs["lemmas"]
+        exact = set.intersection(*(attrs["postings"].get(w, set()) for w in set(words)))
+        inflected = set.intersection(*(attrs["lemma_postings"].get(w, set()) for w in set(norms)))
+        candidates = exact | inflected
+    for i in candidates:
+        if _contains_phrase(tokens[i], words):
+            result[i], kinds[i] = 3.0, "Фраза целиком"
+        elif not (Counter(words) - Counter(tokens[i])):
+            result[i], kinds[i] = 2.0, "Все слова"
+        elif not (Counter(norms) - Counter(lemmas[i])):
+            result[i], kinds[i] = 1.0, "Словоформы"
+    if allow_substring:
+        texts = attrs.get("indexed_texts", tuple(df["search_proc"]))
+        for i, text in enumerate(texts):
+            if result[i] == 0 and preprocess(query) in preprocess(text):
+                result[i], kinds[i] = 0.3, "Часть слова (слабый сигнал)"
+    return result, kinds
+
+
+def search_bundle(query, df, top_k=5, threshold=0.5, semantic_weight=0.65,
+                  allow_substring=False, use_semantic=True):
+    if not 0 <= semantic_weight <= 1 or not -1 <= threshold <= 1:
+        raise ValueError("Некорректные параметры поиска.")
+    lex, kinds = lexical_scores(query, df, allow_substring)
+    sem = semantic_scores(query, df) if use_semantic else None
+    hybrid, semantic, lexical = [], [], []
+    for i in range(len(df)):
+        lscore = float(lex[i])
+        sscore = float(sem[i]) if sem is not None else None
+        if lscore > 0:
+            lexical.append(_result_from_row(df.iloc[i], lscore, match_type=kinds[i]))
+        if sscore is not None and sscore >= threshold:
+            semantic.append(_result_from_row(df.iloc[i], sscore))
+        if not (lscore > 0 or (sscore is not None and sscore >= threshold)):
+            continue
+        if sem is None:
+            combined = lscore / 3
+        else:
+            combined = semantic_weight * max(0, sscore) + (1 - semantic_weight) * lscore / 3
+        if lscore == 3:
+            combined += 0.15
+        hybrid.append(_result_from_row(df.iloc[i], combined, semantic_score=sscore,
+                      lexical_score=lscore, match_type=kinds.get(i, "Семантика")))
+    return {"hybrid": deduplicate_results(hybrid, top_k),
+            "semantic": deduplicate_results(semantic, top_k),
+            "lexical": deduplicate_results(lexical, top_k)}
+
+
+def semantic_search(query, df, top_k=5, threshold=0.5):
+    return search_bundle(query, df, top_k, threshold)["semantic"]
+
+
+def keyword_search(query, df, top_k=5):
+    return search_bundle(query, df, top_k, use_semantic=False)["lexical"]
+
+
+def hybrid_search(query, df, top_k=5, threshold=0.5, semantic_weight=0.65):
+    return search_bundle(query, df, top_k, threshold, semantic_weight)["hybrid"]
