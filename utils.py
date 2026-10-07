@@ -1,8 +1,13 @@
 """Парсинг, безопасная загрузка и гибридный поиск. Python 3.10+."""
 import functools
+import hashlib
+import math
 import re
 import threading
+import zipfile
 from collections import Counter, defaultdict
+from datetime import date, datetime, time
+from io import BytesIO
 from itertools import islice, product
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -14,6 +19,14 @@ MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
 MAX_VARIANTS = 256
+MAX_XLSX_BYTES = 10 * 1024 * 1024
+MAX_XLSX_UNPACKED_BYTES = 50 * 1024 * 1024
+MAX_XLSX_ROWS = 20000
+MAX_XLSX_COLUMNS = 100
+MAX_XLSX_SHEETS = 20
+MAX_XLSX_CELLS = 300000
+TITLE_ALIASES = {"фраза", "запрос", "обращение", "вопрос", "заголовок", "phrase", "query", "title"}
+DATE_ALIASES = {"дата", "date", "дата обращения", "дата создания"}
 CASE_MARKER_RE = re.compile(r"==\s*(?P<title>.*?)\s*==", re.DOTALL)
 SERVICE_FIELD_RE = re.compile(r"^\s*(?P<label>[^:\n]{1,80})\s*:\s*(?P<value>.*)$")
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -224,6 +237,200 @@ def parse_txt_cases(text, source_name="document.txt", parse_mode="auto", custom_
     return cases
 
 
+def excel_value(value):
+    """Строка для карточки и индекса: нули сохраняются, даты читаемы."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y" if value.time() == time() else "%d.%m.%Y %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, time):
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, bool):
+        return "Да" if value else "Нет"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        if value.is_integer():
+            return str(int(value))
+    return str(value).strip()
+
+
+def excel_date(value):
+    """Только Excel-даты и однозначные текстовые форматы; числа не угадываем."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(value.strip(), fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def suggest_header_row(rows):
+    """Предлагает одну строку заголовков; выбор всегда можно изменить."""
+    best = (float("-inf"), 1)
+    aliases = TITLE_ALIASES | DATE_ALIASES | {"интент", "интенты", "комментарий", "comment", "intent"}
+    for number, row in enumerate(rows[:50], 1):
+        values = [normalize_spaces(v) for v in row if excel_value(v)]
+        if not values:
+            continue
+        known = sum(preprocess(v) in aliases for v in values)
+        short = sum(len(v) <= 60 for v in values)
+        unique = len(set(preprocess(v) for v in values))
+        score = known * 10 + min(len(values), 10) + short / len(values) + unique / len(values)
+        if score > best[0]:
+            best = (score, number)
+    return best[1]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def read_xlsx(content):
+    """Читает XLSX, не исполняя формул. Все строки имеют исходные номера."""
+    from openpyxl import load_workbook
+    if not content or len(content) > MAX_XLSX_BYTES:
+        raise ValueError("Пустой XLSX или размер больше 10 МБ.")
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            if (len(archive.infolist()) > 2000 or
+                    sum(item.file_size for item in archive.infolist()) > MAX_XLSX_UNPACKED_BYTES):
+                raise ValueError("XLSX слишком велик после распаковки (лимит 50 МБ).")
+        formulas = load_workbook(BytesIO(content), read_only=True, data_only=False, keep_links=False)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Не удалось открыть XLSX. Нужна обычная книга без пароля.") from exc
+    values = None
+    try:
+        values = load_workbook(BytesIO(content), read_only=True, data_only=True, keep_links=False)
+        if len(formulas.worksheets) > MAX_XLSX_SHEETS:
+            raise ValueError(f"В книге больше {MAX_XLSX_SHEETS} листов.")
+        sheets, budget = {}, 0
+        for ws in formulas.worksheets:
+            if (ws.max_row or 0) > MAX_XLSX_ROWS or (ws.max_column or 0) > MAX_XLSX_COLUMNS:
+                raise ValueError(f"Лист «{ws.title}»: лимит {MAX_XLSX_ROWS} строк и {MAX_XLSX_COLUMNS} колонок. Удалите лишние пустые строки/колонки и их форматирование.")
+            rows, missing, errors = [], 0, 0
+            cached_rows = values[ws.title].iter_rows()
+            for formula_row, cached_row in zip(ws.iter_rows(), cached_rows):
+                if len(rows) >= MAX_XLSX_ROWS or len(formula_row) > MAX_XLSX_COLUMNS:
+                    raise ValueError(f"Лист «{ws.title}» превышает лимит строк или колонок.")
+                budget += len(formula_row)
+                if budget > MAX_XLSX_CELLS:
+                    raise ValueError(f"В книге больше {MAX_XLSX_CELLS} ячеек. Разделите файл.")
+                row = []
+                for cell, cached in zip(formula_row, cached_row):
+                    value = cached.value
+                    if cell.data_type == "f" and value is None:
+                        missing += 1
+                    if cached.data_type == "e":
+                        errors += 1
+                        value = None
+                    row.append(value)
+                rows.append(tuple(row))
+            while rows and not any(excel_value(v) for v in rows[-1]):
+                rows.pop()
+            sheets[ws.title] = {"rows": tuple(rows), "header_row": suggest_header_row(rows),
+                                "missing_formulas": missing, "error_cells": errors}
+        return sheets
+    finally:
+        formulas.close()
+        if values is not None:
+            values.close()
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def xlsx_table(sheet, header_row=1):
+    rows = sheet["rows"]
+    if not isinstance(header_row, int) or not 1 <= header_row <= max(1, len(rows)):
+        raise ValueError("Строка заголовков отсутствует на листе.")
+    if not rows:
+        return {"columns": [], "records": [], "date_columns": []}
+    width = max((i + 1 for row in rows[header_row - 1:] for i, v in enumerate(row) if excel_value(v)), default=0)
+    header = rows[header_row - 1]
+    columns, used = [], set()
+    for i in range(width):
+        original = normalize_spaces(excel_value(header[i])) if i < len(header) else ""
+        base = original or f"Колонка {i + 1}"
+        label, suffix = base, 2
+        while label in used:
+            label = f"{base} ({suffix})"
+            suffix += 1
+        used.add(label)
+        columns.append({"id": f"c{i}", "label": label, "original": original})
+    records, date_cols = [], set()
+    for row_number, row in enumerate(rows[header_row:], header_row + 1):
+        cells, dates = {}, {}
+        for i, column in enumerate(columns):
+            value = row[i] if i < len(row) else None
+            cells[column["id"]] = excel_value(value)
+            parsed_date = excel_date(value)
+            if parsed_date is not None:
+                dates[column["id"]] = parsed_date
+                date_cols.add(column["id"])
+        if any(cells.values()):
+            records.append({"row_number": row_number, "cells": cells, "dates": dates})
+    return {"columns": columns, "records": records,
+            "date_columns": [c["id"] for c in columns if c["id"] in date_cols]}
+
+
+def suggest_xlsx_columns(table):
+    columns = table["columns"]
+    title = next((c["id"] for c in columns if preprocess(c["original"]) in TITLE_ALIASES), None)
+    if title is None:
+        title = next((c["id"] for c in columns if c["id"] not in table["date_columns"]
+                      and preprocess(c["original"]) not in DATE_ALIASES), None)
+    title = title or (columns[0]["id"] if columns else None)
+    search = [c["id"] for c in columns if c["id"] not in table["date_columns"]
+              and preprocess(c["original"]) not in DATE_ALIASES]
+    return {"title_column": title, "search_columns": search or ([title] if title else [])}
+
+
+def parse_xlsx_cases(cfg):
+    table = cfg["table"]
+    columns = {c["id"]: c["label"] for c in table["columns"]}
+    display_labels = {c["id"]: c.get("display_label", c["label"]) for c in table["columns"]}
+    title_col = cfg.get("title_column")
+    search_cols = list(cfg.get("search_columns", list(columns)))
+    display_cols = list(cfg.get("display_columns", list(columns)))
+    if (title_col is not None and title_col not in columns) or any(c not in columns for c in search_cols + display_cols):
+        raise ValueError("Выбрана отсутствующая колонка.")
+    if not search_cols:
+        raise ValueError("Выберите хотя бы одну колонку для поиска.")
+    date_col, start, end = cfg.get("date_column"), cfg.get("date_from"), cfg.get("date_to")
+    if date_col is not None and date_col not in columns:
+        raise ValueError("Колонка даты отсутствует.")
+    if start and end and start > end:
+        raise ValueError("Начальная дата позже конечной.")
+    cases = []
+    for record in table["records"]:
+        cells, row_number = record["cells"], record["row_number"]
+        if date_col is not None:
+            value = record["dates"].get(date_col)
+            if value is None or (start and value < start) or (end and value > end):
+                continue
+        if not any(cells[c] for c in search_cols):
+            continue
+        title = cells.get(title_col, "") if title_col else ""
+        title = title or f"Строка {row_number}"
+        text = "\n".join(f"{columns[c]}: {cells[c]}" for c in search_cols if cells[c])
+        # Названия листов могут содержать ::; хэш не допускает коллизий разделителей.
+        sheet_id = hashlib.sha256(cfg["sheet_name"].encode("utf-8")).hexdigest()[:16]
+        uid = f'{cfg.get("source_id", cfg["name"])}::sheet:{sheet_id}::row:{row_number}'
+        cases.append({"case_uid": uid, "variant_uid": uid + "::1",
+                      "source_file": cfg["name"], "case_index": row_number,
+                      "source_kind": "xlsx", "sheet_name": cfg["sheet_name"], "row_number": row_number,
+                      "title": title, "search_text": text, "search_proc": preprocess(text),
+                      "search_lemmas": set(), "fields": [
+                          {"label": display_labels[c], "value": cells[c]} for c in display_cols
+                          if cells[c] and c != title_col], "raw_tail": ""})
+    return cases
+
+
 @st.cache_data(show_spinner=False, max_entries=32)
 def build_database(doc_configs, scope="case"):
     if scope not in {"title", "case"}:
@@ -232,15 +439,22 @@ def build_database(doc_configs, scope="case"):
     source_ids = set()
     for cfg in doc_configs:
         sid = cfg.get("source_id", cfg["name"])
-        if sid in source_ids:
+        identity = (sid, cfg.get("sheet_name") if cfg.get("kind") == "xlsx" else None)
+        if identity in source_ids:
             raise ValueError("Источники должны иметь разные идентификаторы.")
-        source_ids.add(sid)
-        rows.extend(parse_txt_cases(cfg["text"], cfg["name"], cfg.get("mode", "auto"),
-                                    cfg.get("prefixes", []), sid))
+        source_ids.add(identity)
+        if cfg.get("kind") == "xlsx":
+            rows.extend(parse_xlsx_cases(cfg))
+        else:
+            parsed = parse_txt_cases(cfg["text"], cfg["name"], cfg.get("mode", "auto"),
+                                     cfg.get("prefixes", []), sid)
+            for row in parsed:
+                row.update(source_kind="txt", sheet_name="", row_number=None)
+            rows.extend(parsed)
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    texts = tuple(row["search_text"] + ("\n" + row["raw_tail"] if scope == "case" else "") for row in rows)
+    texts = tuple(row["search_text"] + ("\n" + row["raw_tail"] if scope == "case" and row["source_kind"] == "txt" else "") for row in rows)
     tokens = tuple(tokenize(text) for text in texts)
     lemmas = tuple(tuple(map(lemmatize_cached, words)) for words in tokens)
     postings, lemma_postings = defaultdict(set), defaultdict(set)
@@ -301,6 +515,9 @@ def semantic_scores(query, df):
 def _result_from_row(row, score=None, **details):
     result = {key: row[key] for key in ("case_uid", "source_file", "case_index", "title", "fields", "search_text")}
     result["case_index"] = int(result["case_index"])
+    for key in ("source_kind", "sheet_name", "row_number"):
+        if key in row:
+            result[key] = row[key]
     if score is not None:
         result["score"] = float(score)
     result.update(details)
