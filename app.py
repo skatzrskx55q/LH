@@ -7,7 +7,7 @@ import streamlit as st
 from utils import (
     attach_embeddings, build_database, search_bundle, safe_http_url,
     read_xlsx, xlsx_table, suggest_xlsx_columns, MAX_XLSX_BYTES,
-    automatic_configs, fetch_github_xlsx, DEFAULT_XLSX_URL,
+    automatic_configs, fetch_github_xlsx, DEFAULT_XLSX_URL, tokenize,
 )
 
 st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="collapsed")
@@ -328,10 +328,12 @@ def main():
     with query_col:
         query = st.text_input("Поисковый запрос", placeholder="Например: изменить дату платежа", key="query")
     with type_col:
-        label = st.selectbox("Тип поиска", ["Гибридный", "Семантический", "Лексический (BM25)"], key="search_type")
+        label = st.selectbox("Тип поиска", ["Гибридный", "Семантический", "По совпадению"], key="search_type")
     with count_col:
         top_k = int(st.number_input("Результатов", min_value=1, max_value=20, value=5))
-    search_type = {"Гибридный": "hybrid", "Семантический": "semantic", "Лексический (BM25)": "lexical"}[label]
+    search_type = {"Гибридный": "hybrid", "Семантический": "semantic", "По совпадению": "lexical"}[label]
+    if search_type == "lexical":
+        st.caption("Фрагменты от трёх символов или словоформы. Достаточно одного совпадения; больше совпадений — выше результат. Выдача ограничена полем «Результатов».")
     configs = []
     threshold, k1, b, rrf_k, pool, diagnostics = 0.5, 1.2, 0.75, 60, 100, False
     if mode == "Автоматический":
@@ -407,6 +409,9 @@ def main():
     st.caption(f"В базе: {total} строк · листов: {len(configs)}")
     if not query.strip():
         return
+    if search_type == "lexical" and not any(len(word) >= 3 for word in tokenize(query)):
+        st.info("Введите хотя бы одно слово или фрагмент длиной от трёх символов.")
+        return
     actual_type = search_type
     try:
         if search_type != "lexical":
@@ -418,16 +423,16 @@ def main():
         if search_type != "hybrid":
             st.error(f"Выбранный поиск недоступен: {exc}")
             if search_type == "semantic":
-                st.info("Для текстового поиска выберите «Лексический (BM25)».")
+                st.info("Для текстового поиска выберите «По совпадению».")
             return
         st.warning(f"Семантическая часть недоступна: {exc}. Показаны только результаты BM25.")
         actual_type = "lexical"
         try:
-            results = search_bundle(query, df, top_k, threshold, "lexical", k1, b, rrf_k, pool)
+            results = search_bundle(query, df, top_k, threshold, "bm25", k1, b, rrf_k, pool)
         except Exception as fallback_exc:
             st.error(f"Лексический поиск недоступен: {fallback_exc}")
             return
-    titles = {"hybrid": "Гибридный поиск · RRF", "semantic": "Семантический поиск", "lexical": "Лексический поиск · BM25"}
+    titles = {"hybrid": "Гибридный поиск · RRF", "semantic": "Семантический поиск", "lexical": "Лексический поиск · BM25" if search_type == "hybrid" else "По совпадению"}
     render_results(titles[actual_type], results[actual_type], total)
     st.caption("Баллы BM25, семантики и RRF имеют разные шкалы и не являются вероятностью правильного ответа.")
     if diagnostics:
