@@ -339,7 +339,7 @@ def build_database(workbook_configs):
 
 
 def automatic_configs(sheets, name="example_cases.xlsx", source_id="github-default"):
-    """Строго: первая строка — подписи, первая физическая колонка — поиск."""
+    """Первая строка — подписи; поиск по ***-колонкам или по первой без меток."""
     configs, reports = [], []
     for sheet_name, sheet in sheets.items():
         if not sheet.get("visible", True) or not sheet["rows"]:
@@ -348,16 +348,32 @@ def automatic_configs(sheets, name="example_cases.xlsx", source_id="github-defau
         if not table["columns"]:
             continue
         first = table["columns"][0]["id"]
-        skipped = sum(not record["cells"][first] for record in table["records"])
-        populated = [r for r in table["records"] if r["cells"][first]]
-        date_or_number = sum(first in r["dates"] or bool(re.fullmatch(r"[\d\s.,+-]+", r["cells"][first])) for r in populated)
-        reports.append({"sheet": sheet_name, "column": table["columns"][0]["label"],
+        marked = [c["id"] for c in table["columns"] if "***" in c["original"]]
+        search_columns = marked or [first]
+        # Копия схемы: очистка подписей не меняет кэш и настройки ручного режима.
+        clean_columns, used = [], set()
+        for i, column in enumerate(table["columns"], 1):
+            base = normalize_spaces(column["original"].replace("***", "")) or f"Колонка {i}"
+            label, suffix = base, 2
+            while label in used:
+                label = f"{base} ({suffix})"
+                suffix += 1
+            used.add(label)
+            clean_columns.append({**column, "label": label, "display_label": label})
+        table = {**table, "columns": clean_columns}
+        skipped = sum(not any(r["cells"][c] for c in search_columns) for r in table["records"])
+        populated = [r for r in table["records"] if any(r["cells"][c] for c in search_columns)]
+        values = [(r, c) for r in populated for c in search_columns if r["cells"][c]]
+        date_or_number = sum(c in r["dates"] or bool(re.fullmatch(r"[\d\s.,+-]+", r["cells"][c])) for r, c in values)
+        labels = {c["id"]: c["label"] for c in clean_columns}
+        reports.append({"sheet": sheet_name, "column": labels[first],
+                        "columns": [labels[c] for c in search_columns], "marked": bool(marked),
                         "skipped": skipped, "rows": len(populated),
-                        "nontext": bool(populated) and date_or_number / len(populated) >= 0.5,
+                        "nontext": bool(values) and date_or_number / len(values) >= 0.5,
                         "header_warning": sheet["header_row"] != 1,
                         "missing_formulas": sheet["missing_formulas"], "error_cells": sheet["error_cells"]})
         configs.append({"kind": "xlsx", "name": name, "source_id": source_id, "sheet_name": sheet_name,
-                        "table": table, "title_column": first, "search_columns": [first],
+                        "table": table, "title_column": first, "search_columns": search_columns,
                         "display_columns": [c["id"] for c in table["columns"]]})
     return configs, reports
 
