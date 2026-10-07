@@ -467,9 +467,28 @@ def lexical_scores(query, df, k1=1.2, b=0.75):
     return result, {i: "BM25" for i in np.flatnonzero(result > 0)}
 
 
+def matching_scores(query, df):
+    """OR по фрагментам от трёх символов и их леммам в поисковых колонках."""
+    fragments = set(word for word in tokenize(query) if len(word) >= 3)
+    scores = np.zeros(len(df), dtype=np.float64)
+    matches = {}
+    if not fragments or df.empty:
+        return scores, matches
+    norms = {word: lemmatize_cached(word) for word in fragments}
+    for i, (words, lemmas) in enumerate(zip(df.attrs["tokens"], df.attrs["lemmas"])):
+        lemma_set = set(lemmas)
+        found = {fragment for fragment in fragments
+                 if norms[fragment] in lemma_set
+                 or any(fragment in word for word in words)}
+        if found:
+            scores[i] = len(found) / len(fragments)
+            matches[i] = "По совпадению"
+    return scores, matches
+
+
 def search_bundle(query, df, top_k=5, threshold=0.5, search_type="hybrid",
                   bm25_k1=1.2, bm25_b=0.75, rrf_k=60, candidate_pool=100):
-    if search_type not in {"hybrid", "semantic", "lexical"}:
+    if search_type not in {"hybrid", "semantic", "lexical", "bm25"}:
         raise ValueError("Неизвестный тип поиска.")
     if not -1 <= threshold <= 1 or rrf_k < 1 or top_k < 1 or candidate_pool < 1:
         raise ValueError("Некорректные параметры поиска.")
@@ -477,7 +496,12 @@ def search_bundle(query, df, top_k=5, threshold=0.5, search_type="hybrid",
     if df.empty or not tokenize(query):
         return output
     lexical, semantic = [], []
-    if search_type in {"hybrid", "lexical"}:
+    if search_type == "lexical":
+        scores, matches = matching_scores(query, df)
+        lexical = [_result_from_row(df.iloc[i], score, match_type=matches[i])
+                   for i, score in enumerate(scores) if score > 0]
+        lexical = deduplicate_results(lexical, len(df))
+    if search_type in {"hybrid", "bm25"}:
         scores, _ = lexical_scores(query, df, bm25_k1, bm25_b)
         lexical = [_result_from_row(df.iloc[i], score, lexical_score=float(score), match_type="BM25")
                    for i, score in enumerate(scores) if score > 0]
