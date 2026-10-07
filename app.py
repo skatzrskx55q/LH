@@ -8,6 +8,7 @@ import streamlit as st
 from utils import (
     attach_embeddings, build_database, decode_text_bytes, fetch_url_text,
     search_bundle, safe_http_url, MAX_DOCUMENT_BYTES, MODEL_ID,
+    read_xlsx, xlsx_table, suggest_xlsx_columns, MAX_XLSX_BYTES,
 )
 
 st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="collapsed")
@@ -177,10 +178,14 @@ def field_row(label, value, stacked=False):
 
 
 def render_card(item, rank, show_score=True, is_best=False):
+    if item.get("source_kind") == "xlsx":
+        location = f'лист «{item["sheet_name"]}» · строка {int(item["row_number"])}'
+    else:
+        location = f'кейс {int(item["case_index"])}'
     parts = [f'<div class="modern-card{" is-best" if is_best else ""}">',
              f'<div class="card-header"><div class="card-rank">{rank}</div>',
              f'<div class="card-title">{escape(item["title"])}</div></div>',
-             f'<div style="color:#a1a1aa;font-size:12px;margin-bottom:12px">Источник: {escape(item["source_file"])} · кейс {int(item["case_index"])}</div>']
+             f'<div style="color:#a1a1aa;font-size:12px;margin-bottom:12px">Источник: {escape(item["source_file"])} · {escape(location)}</div>']
     if item.get("fields"):
         parts.append('<div class="data-grid">')
         for field in item["fields"]:
@@ -222,6 +227,94 @@ def source_key(kind, value):
     return kind + ":" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
+def configure_xlsx(doc, sid):
+    """Независимые настройки каждого выбранного листа, сохранённые в сессии."""
+    sheets = doc["sheets"]
+    widget_source = sid + ":" + doc.get("content_stamp", "")
+    selected = st.multiselect("Листы для поиска", list(sheets), default=list(sheets)[:1], key=f"sheets_{widget_source}")
+    configs = []
+    for name in selected:
+        sheet = sheets[name]
+        key = source_key("sheet", widget_source + ":" + name)
+        with st.container(border=True):
+            st.markdown(f"**Лист: {escape(name)}**")
+            if not sheet["rows"]:
+                st.info("Лист пуст.")
+                continue
+            st.caption("Предпросмотр первых 20 строк. Число слева — номер строки в Excel.")
+            preview = pd.DataFrame([[str(v) if v is not None else "" for v in row]
+                                    for row in sheet["rows"][:20]],
+                                   index=range(1, min(20, len(sheet["rows"])) + 1))
+            preview.columns = [f"Колонка {i + 1}" for i in range(len(preview.columns))]
+            st.dataframe(preview, use_container_width=True)
+            header = int(st.number_input("Строка с названиями колонок", min_value=1,
+                          max_value=len(sheet["rows"]), value=sheet["header_row"], step=1, key=f"header_{key}"))
+            table = xlsx_table(sheet, header)
+            columns = table["columns"]
+            if not columns:
+                st.info("Ниже выбранной строки нет данных.")
+                continue
+            # Смена заголовков сбрасывает только зависимые настройки этого листа.
+            key += f"_h{header}"
+            labels = {c["id"]: c["label"] for c in columns}
+            ids = list(labels)
+            suggested = suggest_xlsx_columns(table)
+            if any(not c["original"] for c in columns) or len({c["original"] for c in columns}) < len(columns):
+                st.caption("Пустые заголовки получили название «Колонка N»; повторяющиеся — числовой суффикс.")
+            if sheet["missing_formulas"]:
+                st.warning(f'У {sheet["missing_formulas"]} ячеек с формулами нет сохранённого результата. Они считаются пустыми. Пересчитайте книгу в Excel/LibreOffice и сохраните её.')
+            if sheet["error_cells"]:
+                st.warning(f'Ячейки с ошибками Excel считаются пустыми: {sheet["error_cells"]}.')
+            title_options = [None] + ids
+            title = st.selectbox("Колонка заголовка карточки", title_options,
+                                 index=title_options.index(suggested["title_column"]),
+                                 format_func=lambda c: "Номер строки" if c is None else labels[c],
+                                 key=f"title_{key}")
+            mode = st.radio("Искать в таблице", ["По основной фразе", "По выбранным колонкам", "По всей строке"],
+                            horizontal=True, key=f"search_mode_{key}")
+            if mode == "По основной фразе":
+                search_columns = [title] if title else []
+            elif mode == "По всей строке":
+                search_columns = ids
+            else:
+                search_columns = st.multiselect("Колонки для поиска", ids,
+                                default=suggested["search_columns"], format_func=labels.get, key=f"search_cols_{key}")
+            display_columns = st.multiselect("Колонки для отображения", ids, default=ids,
+                                            format_func=labels.get, key=f"display_{key}",
+                                            help="Заголовок карточки показывается отдельно. Остальные пустые поля скрываются.")
+            st.caption("Поисковые колонки определяют совпадения. Колонки для отображения определяют только содержимое карточки.")
+            display_table = table
+            if st.checkbox("Изменить подписи полей", key=f"rename_{key}"):
+                renamed = []
+                for column in columns:
+                    label = st.text_input(f'Подпись: {column["label"]}', value=column["label"],
+                                          key=f'rename_{key}_{column["id"]}').strip()
+                    renamed.append({**column, "display_label": label or column["label"]})
+                display_table = {**table, "columns": renamed}
+            date_column, date_from, date_to = None, None, None
+            if table["date_columns"] and st.checkbox("Фильтровать по дате", key=f"date_filter_{key}"):
+                date_column = st.selectbox("Колонка даты", table["date_columns"], format_func=labels.get, key=f"date_col_{key}")
+                dates = [r["dates"][date_column] for r in table["records"] if date_column in r["dates"]]
+                c1, c2 = st.columns(2)
+                with c1:
+                    date_from = st.date_input("Дата с", value=min(dates), key=f"from_{key}_{date_column}")
+                with c2:
+                    date_to = st.date_input("Дата по", value=max(dates), key=f"to_{key}_{date_column}")
+                st.caption("Границы включены. Строки без распознанной даты исключаются при включённом фильтре.")
+            if not search_columns:
+                st.warning("Выберите колонку основной фразы или хотя бы одну колонку для поиска.")
+                continue
+            if date_from and date_to and date_from > date_to:
+                st.warning("Дата начала должна быть не позже даты окончания.")
+                continue
+            st.caption(f'Строк данных: {len(table["records"])}. Строки с пустыми поисковыми ячейками не индексируются.')
+            configs.append({"kind": "xlsx", "name": doc["name"], "source_id": sid,
+                            "sheet_name": name, "table": display_table, "title_column": title,
+                            "search_columns": search_columns, "display_columns": display_columns,
+                            "date_column": date_column, "date_from": date_from, "date_to": date_to})
+    return configs
+
+
 def main():
     st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
     st.markdown('<div style="text-align:center;color:#f4f4f5"><h1>Помощник разметчика</h1><p>Поиск по кейсам и сопоставление интентов</p></div>', unsafe_allow_html=True)
@@ -230,16 +323,17 @@ def main():
         query = st.text_input("Поисковый запрос", placeholder="Например: изменить дату платежа", key="query")
     with count_col:
         top_k = st.number_input("Результатов", min_value=1, max_value=20, value=5)
-    scope_label = st.radio("Область поиска", ["Весь кейс", "Только заголовки"], horizontal=True,
-                          help="Весь кейс включает заголовок, статью, интенты и остальные поля.")
+    scope_label = st.radio("Поиск в TXT", ["Весь кейс", "Только заголовки"], horizontal=True,
+                          help="Для Excel поисковые колонки настраиваются отдельно на каждом листе в источниках данных.")
     scope = "case" if scope_label == "Весь кейс" else "title"
     configs = []
     with st.expander("⚙️ Источники данных и настройки парсинга", expanded=not st.session_state.get("sources_ready", False)):
         col_upload, col_urls = st.columns(2)
         with col_upload:
-            uploads = st.file_uploader("Локальные файлы (.txt)", type="txt", accept_multiple_files=True)
+            uploads = st.file_uploader("Локальные файлы (.txt, .xlsx)", type=["txt", "xlsx"], accept_multiple_files=True)
+            st.caption("TXT — до 5 МБ, XLSX — до 10 МБ. Можно использовать оба формата одновременно.")
         with col_urls:
-            urls_text = st.text_area("Прямые ссылки raw.githubusercontent.com", value=DEFAULT_GITHUB, height=100)
+            urls_text = st.text_area("Прямые ссылки raw.githubusercontent.com на TXT", value=DEFAULT_GITHUB, height=100)
         if st.button("Обновить документы по ссылкам"):
             cached_fetch_url.clear()
         docs = {}
@@ -256,18 +350,29 @@ def main():
                 st.warning(f"Не удалось загрузить {name}: {exc}")
         for index, file in enumerate(uploads or []):
             try:
-                if file.size > MAX_DOCUMENT_BYTES:
-                    raise ValueError("Размер документа превышает 5 МБ.")
+                content = file.getvalue()
+                is_xlsx = file.name.casefold().endswith(".xlsx")
+                limit = MAX_XLSX_BYTES if is_xlsx else MAX_DOCUMENT_BYTES
+                if len(content) > limit:
+                    raise ValueError(f"Размер файла превышает {limit // (1024 * 1024)} МБ.")
                 sid = source_key("local", f"{file.name}:{index}")
-                docs[sid] = {"name": file.name, "text": decode_text_bytes(file.getvalue()), "source_id": sid}
-            except ValueError as exc:
+                if is_xlsx:
+                    docs[sid] = {"name": file.name, "sheets": read_xlsx(content), "source_id": sid, "kind": "xlsx",
+                                 "content_stamp": hashlib.sha256(content).hexdigest()[:16]}
+                else:
+                    docs[sid] = {"name": file.name, "text": decode_text_bytes(content), "source_id": sid, "kind": "txt"}
+            except Exception as exc:
                 st.warning(f"{file.name}: {exc}")
         duplicate_names = pd.Series([d["name"] for d in docs.values()]).value_counts().to_dict() if docs else {}
         def doc_label(sid):
             name = docs[sid]["name"]
             return f"{name} · {sid}" if duplicate_names[name] > 1 else name
-        active = st.multiselect("Документы для работы", list(docs), default=list(docs), format_func=doc_label)
+        active = st.multiselect("Документы и книги для работы", list(docs), default=list(docs), format_func=doc_label)
         for sid in active:
+            if docs[sid].get("kind") == "xlsx":
+                st.subheader(doc_label(sid))
+                configs.extend(configure_xlsx(docs[sid], sid))
+                continue
             c1, c2 = st.columns([2, 1])
             with c1:
                 st.caption(doc_label(sid))
@@ -295,7 +400,7 @@ def main():
         st.error(f"Ошибка разбора документов: {exc}")
         return
     if df.empty:
-        st.warning("Нет кейсов. Используйте заголовки в формате ==текст кейса==.")
+        st.warning("Нет кейсов. В TXT нужны заголовки ==текст кейса==. В XLSX проверьте лист, строку заголовков, поисковые колонки и фильтр дат.")
         return
     st.caption(f'В базе: {df["case_uid"].nunique()} кейсов · {len(df)} вариантов')
     if not query.strip():
@@ -325,7 +430,7 @@ def main():
         with st.expander("Диагностика", expanded=True):
             render_results("Семантика", results["semantic"], int(df["case_uid"].nunique()), icon="✨")
             render_results("Точные фразы, слова и словоформы", results["lexical"], int(df["case_uid"].nunique()), icon="🎯")
-            columns = ["case_uid", "source_file", "case_index", "title"]
+            columns = ["case_uid", "source_file", "source_kind", "sheet_name", "case_index", "title"]
             catalog = df[columns].drop_duplicates("case_uid")
             st.dataframe(catalog, use_container_width=True, hide_index=True)
             st.download_button("Скачать ID кейсов для оценки", catalog.to_csv(index=False).encode("utf-8-sig"),
