@@ -338,11 +338,12 @@ def main():
         try:
             doc = github_book()
             configs, reports = automatic_configs(doc["sheets"], doc["name"], source_key("github", DEFAULT_XLSX_URL))
-            st.caption("Таблица загружена из GitHub. Поиск — только по первой колонке каждого видимого листа. Остальные поля показываются в карточке.")
+            st.caption("Таблица загружена из GitHub. Поиск идёт по колонкам с *** в названии; без меток — по первой колонке. Все поля строки доступны в карточке.")
             for report in reports:
-                st.caption(f'{report["sheet"]}: поиск по «{report["column"]}» · строк: {report["rows"]} · пропущено с пустой первой ячейкой: {report["skipped"]}')
+                column_names = "», «".join(report["columns"])
+                st.caption(f'{report["sheet"]}: поиск по «{column_names}» · строк: {report["rows"]} · пропущено без поискового текста: {report["skipped"]}')
                 if report["nontext"]:
-                    st.warning(f'На листе «{report["sheet"]}» в первой колонке преимущественно даты или числа. Поиск всё равно идёт по ней. Для выбора другой колонки перейдите в ручной режим.')
+                    st.warning(f'На листе «{report["sheet"]}» в поисковых колонках преимущественно даты или числа. Можно отметить другие заголовки меткой *** в Excel или выбрать колонки в ручном режиме.')
                 if report["header_warning"]:
                     st.warning(f'На листе «{report["sheet"]}» заголовки, возможно, ниже первой строки. Автоматический режим использует строку 1; другую можно выбрать в ручном режиме.')
                 if report["missing_formulas"] or report["error_cells"]:
@@ -400,7 +401,7 @@ def main():
         st.error(f"Ошибка обработки таблиц: {exc}")
         return
     if df.empty:
-        st.warning("Нет строк для поиска. Проверьте первую колонку или настройки ручного режима.")
+        st.warning("Нет строк для поиска. Проверьте отмеченные колонки (или первую, если меток нет) либо настройки ручного режима.")
         return
     total = int(df["case_uid"].nunique())
     st.caption(f"В базе: {total} строк · листов: {len(configs)}")
