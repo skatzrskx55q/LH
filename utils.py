@@ -1,4 +1,4 @@
-"""Парсинг, безопасная загрузка и гибридный поиск. Python 3.10+."""
+"""Чтение XLSX, индекс строк и гибридный поиск. Python 3.11–3.12."""
 import functools
 import hashlib
 import math
@@ -8,17 +8,13 @@ import zipfile
 from collections import Counter, defaultdict
 from datetime import date, datetime, time
 from io import BytesIO
-from itertools import islice, product
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
-REQUEST_TIMEOUT_SECONDS = 30
-MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
-MAX_VARIANTS = 256
 MAX_XLSX_BYTES = 10 * 1024 * 1024
 MAX_XLSX_UNPACKED_BYTES = 50 * 1024 * 1024
 MAX_XLSX_ROWS = 20000
@@ -27,8 +23,6 @@ MAX_XLSX_SHEETS = 20
 MAX_XLSX_CELLS = 300000
 TITLE_ALIASES = {"фраза", "запрос", "обращение", "вопрос", "заголовок", "phrase", "query", "title"}
 DATE_ALIASES = {"дата", "date", "дата обращения", "дата создания"}
-CASE_MARKER_RE = re.compile(r"==\s*(?P<title>.*?)\s*==", re.DOTALL)
-SERVICE_FIELD_RE = re.compile(r"^\s*(?P<label>[^:\n]{1,80})\s*:\s*(?P<value>.*)$")
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
@@ -58,9 +52,6 @@ def preprocess(text):
     return normalize_spaces(text).casefold().replace("ё", "е")
 
 
-def normalize_line_endings(text):
-    return str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-
 
 def tokenize(text):
     return tuple(TOKEN_RE.findall(preprocess(text)))
@@ -73,17 +64,6 @@ def lemmatize_cached(word):
 
 def lemmatize(word):
     return lemmatize_cached(word)
-
-
-def decode_text_bytes(content):
-    if len(content) > MAX_DOCUMENT_BYTES:
-        raise ValueError("Размер документа превышает 5 МБ.")
-    for encoding in ("utf-8-sig", "cp1251", "latin-1"):
-        try:
-            return content.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("Не удалось определить кодировку документа.")
 
 
 def safe_http_url(value):
@@ -102,143 +82,8 @@ def safe_http_url(value):
         return None
 
 
-def validate_source_url(url):
-    url = str(url).strip()
-    if not safe_http_url(url):
-        raise ValueError("Некорректный URL источника.")
-    parts = urlsplit(url)
-    if (parts.scheme != "https" or parts.hostname != "raw.githubusercontent.com"
-            or parts.port not in (None, 443)):
-        raise ValueError("Источники разрешены только с https://raw.githubusercontent.com.")
-    if len([part for part in parts.path.split("/") if part]) < 4:
-        raise ValueError("Укажите прямую ссылку на файл GitHub: владелец/репозиторий/ветка/файл.")
-    return urlunsplit(("https", "raw.githubusercontent.com", parts.path, parts.query, ""))
-
-
-def fetch_url_text(url):
-    """Allowlist проверяется заново на каждом перенаправлении; ошибки идут в UI."""
-    import requests
-    url = validate_source_url(url)
-    with requests.Session() as session:
-        session.trust_env = False
-        for _ in range(4):
-            with session.get(url, timeout=(5, REQUEST_TIMEOUT_SECONDS),
-                             allow_redirects=False, stream=True) as response:
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise ValueError("Перенаправление без адреса.")
-                    url = validate_source_url(urljoin(url, location))
-                    continue
-                response.raise_for_status()
-                size = 0
-                chunks = []
-                for chunk in response.iter_content(chunk_size=65536):
-                    size += len(chunk)
-                    if size > MAX_DOCUMENT_BYTES:
-                        raise ValueError("Размер документа превышает 5 МБ.")
-                    chunks.append(chunk)
-                return decode_text_bytes(b"".join(chunks))
-    raise ValueError("Слишком много перенаправлений.")
-
-
-def split_by_slash(phrase):
-    phrase = normalize_spaces(phrase)
-    variants = []
-    for segment in phrase.split("|"):
-        segment = segment.strip()
-        if not segment:
-            continue
-        # URL внутри заголовка не является набором альтернатив.
-        urls = [(m.start(), m.end()) for m in re.finditer(r"https?://\S+", segment)]
-        parts = []
-        last = 0
-        for match in re.finditer(r"\b[\w-]+(?:/[\w-]+)+\b", segment):
-            if any(a <= match.start() < b for a, b in urls):
-                continue
-            parts.extend([[segment[last:match.start()]], match.group().split("/")])
-            last = match.end()
-        parts.append([segment[last:]])
-        for combo in islice(product(*parts), MAX_VARIANTS + 1):
-            variant = normalize_spaces("".join(combo))
-            if variant and variant not in variants:
-                variants.append(variant)
-                if len(variants) > MAX_VARIANTS:
-                    raise ValueError(f"Больше {MAX_VARIANTS} вариантов в одном заголовке; разделите кейс.")
-    return variants
-
-
-def parse_service_fields(tail, parse_mode="auto", custom_prefixes=None):
-    if parse_mode not in {"auto", "custom", "none"}:
-        raise ValueError("Неизвестный режим парсинга.")
-    if parse_mode == "none":
-        return [{"label": "", "value": tail.strip()}] if tail.strip() else []
-    prefixes = {normalize_spaces(p).rstrip(":").casefold() for p in (custom_prefixes or [])}
-    fields, preamble, values = [], [], []
-    label = ""
-
-    def flush():
-        nonlocal label, values
-        if label:
-            fields.append({"label": label, "value": "\n".join(values).strip()})
-        label, values = "", []
-
-    for raw_line in normalize_line_endings(tail).split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        # URL никогда не попадает в универсальный шаблон label: value.
-        if re.match(r"https?://", line, re.I):
-            if parse_mode == "auto" and safe_http_url(line):
-                flush()
-                fields.append({"label": "Ссылка", "value": line})
-            elif label:
-                values.append(line)
-            else:
-                preamble.append(line)
-            continue
-        match = SERVICE_FIELD_RE.match(line)
-        candidate = normalize_spaces(match.group("label")) if match else ""
-        if match and (parse_mode == "auto" or candidate.casefold() in prefixes):
-            flush()
-            label = candidate
-            values = [match.group("value").strip()]
-        elif label:
-            values.append(line)
-        else:
-            preamble.append(line)
-    flush()
-    if preamble:
-        fields.insert(0, {"label": "", "value": "\n".join(preamble)})
-    return fields
-
-
-def parse_txt_cases(text, source_name="document.txt", parse_mode="auto", custom_prefixes=None,
-                    source_id=None):
-    text = normalize_line_endings(text)
-    markers = list(CASE_MARKER_RE.finditer(text))
-    cases = []
-    source_id = source_id or source_name
-    for offset, marker in enumerate(markers):
-        index = offset + 1
-        title = normalize_spaces(marker.group("title"))
-        if not title:
-            continue
-        end = markers[offset + 1].start() if offset + 1 < len(markers) else len(text)
-        tail = text[marker.end():end].strip()
-        fields = parse_service_fields(tail, parse_mode, custom_prefixes)
-        for vi, variant in enumerate(split_by_slash(title), 1):
-            cases.append({"case_uid": f"{source_id}::{index}",
-                          "variant_uid": f"{source_id}::{index}::{vi}",
-                          "source_file": source_name, "case_index": index,
-                          "title": title, "search_text": variant, "search_proc": preprocess(variant),
-                          "search_lemmas": set(map(lemmatize_cached, tokenize(variant))),
-                          "fields": fields, "raw_tail": tail})
-    return cases
-
-
 def excel_value(value):
-    """Строка для карточки и индекса: нули сохраняются, даты читаемы."""
+    """Сохраняет нули и переносы строк, приводит даты к читаемому виду."""
     if value is None:
         return ""
     if isinstance(value, datetime):
@@ -258,7 +103,6 @@ def excel_value(value):
 
 
 def excel_date(value):
-    """Только Excel-даты и однозначные текстовые форматы; числа не угадываем."""
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -273,11 +117,11 @@ def excel_date(value):
 
 
 def suggest_header_row(rows):
-    """Предлагает одну строку заголовков; выбор всегда можно изменить."""
+    """Предлагает строку заголовков; её всегда можно изменить вручную."""
     best = (float("-inf"), 1)
     aliases = TITLE_ALIASES | DATE_ALIASES | {"интент", "интенты", "комментарий", "comment", "intent"}
     for number, row in enumerate(rows[:50], 1):
-        values = [normalize_spaces(v) for v in row if excel_value(v)]
+        values = [normalize_spaces(excel_value(v)) for v in row if excel_value(v)]
         if not values:
             continue
         known = sum(preprocess(v) in aliases for v in values)
@@ -291,15 +135,14 @@ def suggest_header_row(rows):
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def read_xlsx(content):
-    """Читает XLSX, не исполняя формул. Все строки имеют исходные номера."""
+    """Читает только XLSX. Формулы не вычисляет: берёт сохранённые значения."""
     from openpyxl import load_workbook
     if not content or len(content) > MAX_XLSX_BYTES:
         raise ValueError("Пустой XLSX или размер больше 10 МБ.")
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
-            if (len(archive.infolist()) > 2000 or
-                    sum(item.file_size for item in archive.infolist()) > MAX_XLSX_UNPACKED_BYTES):
-                raise ValueError("XLSX слишком велик после распаковки (лимит 50 МБ).")
+            if len(archive.infolist()) > 2000 or sum(i.file_size for i in archive.infolist()) > MAX_XLSX_UNPACKED_BYTES:
+                raise ValueError("Книга слишком велика после распаковки (лимит 50 МБ).")
         formulas = load_workbook(BytesIO(content), read_only=True, data_only=False, keep_links=False)
     except ValueError:
         raise
@@ -315,8 +158,7 @@ def read_xlsx(content):
             if (ws.max_row or 0) > MAX_XLSX_ROWS or (ws.max_column or 0) > MAX_XLSX_COLUMNS:
                 raise ValueError(f"Лист «{ws.title}»: лимит {MAX_XLSX_ROWS} строк и {MAX_XLSX_COLUMNS} колонок. Удалите лишние пустые строки/колонки и их форматирование.")
             rows, missing, errors = [], 0, 0
-            cached_rows = values[ws.title].iter_rows()
-            for formula_row, cached_row in zip(ws.iter_rows(), cached_rows):
+            for formula_row, cached_row in zip(ws.iter_rows(), values[ws.title].iter_rows()):
                 if len(rows) >= MAX_XLSX_ROWS or len(formula_row) > MAX_XLSX_COLUMNS:
                     raise ValueError(f"Лист «{ws.title}» превышает лимит строк или колонок.")
                 budget += len(formula_row)
@@ -335,7 +177,7 @@ def read_xlsx(content):
             while rows and not any(excel_value(v) for v in rows[-1]):
                 rows.pop()
             sheets[ws.title] = {"rows": tuple(rows), "header_row": suggest_header_row(rows),
-                                "missing_formulas": missing, "error_cells": errors}
+                               "missing_formulas": missing, "error_cells": errors}
         return sheets
     finally:
         formulas.close()
@@ -391,6 +233,8 @@ def suggest_xlsx_columns(table):
 
 
 def parse_xlsx_cases(cfg):
+    if cfg.get("kind") != "xlsx" or "table" not in cfg or "sheet_name" not in cfg:
+        raise ValueError("Источник должен быть настроенным листом XLSX.")
     table = cfg["table"]
     columns = {c["id"]: c["label"] for c in table["columns"]}
     display_labels = {c["id"]: c.get("display_label", c["label"]) for c in table["columns"]}
@@ -406,6 +250,7 @@ def parse_xlsx_cases(cfg):
         raise ValueError("Колонка даты отсутствует.")
     if start and end and start > end:
         raise ValueError("Начальная дата позже конечной.")
+    sheet_id = hashlib.sha256(cfg["sheet_name"].encode("utf-8")).hexdigest()[:16]
     cases = []
     for record in table["records"]:
         cells, row_number = record["cells"], record["row_number"]
@@ -415,46 +260,33 @@ def parse_xlsx_cases(cfg):
                 continue
         if not any(cells[c] for c in search_cols):
             continue
-        title = cells.get(title_col, "") if title_col else ""
-        title = title or f"Строка {row_number}"
+        title = (cells.get(title_col, "") if title_col else "") or f"Строка {row_number}"
         text = "\n".join(f"{columns[c]}: {cells[c]}" for c in search_cols if cells[c])
-        # Названия листов могут содержать ::; хэш не допускает коллизий разделителей.
-        sheet_id = hashlib.sha256(cfg["sheet_name"].encode("utf-8")).hexdigest()[:16]
         uid = f'{cfg.get("source_id", cfg["name"])}::sheet:{sheet_id}::row:{row_number}'
-        cases.append({"case_uid": uid, "variant_uid": uid + "::1",
-                      "source_file": cfg["name"], "case_index": row_number,
-                      "source_kind": "xlsx", "sheet_name": cfg["sheet_name"], "row_number": row_number,
-                      "title": title, "search_text": text, "search_proc": preprocess(text),
-                      "search_lemmas": set(), "fields": [
+        cases.append({"case_uid": uid, "source_file": cfg["name"], "sheet_name": cfg["sheet_name"],
+                      "row_number": row_number, "title": title, "search_text": text,
+                      "search_proc": preprocess(text), "fields": [
                           {"label": display_labels[c], "value": cells[c]} for c in display_cols
-                          if cells[c] and c != title_col], "raw_tail": ""})
+                          if cells[c] and c != title_col]})
     return cases
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
-def build_database(doc_configs, scope="case"):
-    if scope not in {"title", "case"}:
-        raise ValueError("Неизвестная область поиска.")
-    rows = []
-    source_ids = set()
-    for cfg in doc_configs:
-        sid = cfg.get("source_id", cfg["name"])
-        identity = (sid, cfg.get("sheet_name") if cfg.get("kind") == "xlsx" else None)
-        if identity in source_ids:
-            raise ValueError("Источники должны иметь разные идентификаторы.")
-        source_ids.add(identity)
-        if cfg.get("kind") == "xlsx":
-            rows.extend(parse_xlsx_cases(cfg))
-        else:
-            parsed = parse_txt_cases(cfg["text"], cfg["name"], cfg.get("mode", "auto"),
-                                     cfg.get("prefixes", []), sid)
-            for row in parsed:
-                row.update(source_kind="txt", sheet_name="", row_number=None)
-            rows.extend(parsed)
+def build_database(workbook_configs):
+    """Индексирует только строки настроенных листов XLSX."""
+    rows, identities = [], set()
+    for cfg in workbook_configs:
+        if cfg.get("kind") != "xlsx" or "table" not in cfg or "sheet_name" not in cfg:
+            raise ValueError("Для индекса нужны настроенные листы XLSX.")
+        identity = (cfg.get("source_id", cfg["name"]), cfg["sheet_name"])
+        if identity in identities:
+            raise ValueError("Один лист одного источника выбран несколько раз.")
+        identities.add(identity)
+        rows.extend(parse_xlsx_cases(cfg))
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    texts = tuple(row["search_text"] + ("\n" + row["raw_tail"] if scope == "case" and row["source_kind"] == "txt" else "") for row in rows)
+    texts = tuple(row["search_text"] for row in rows)
     tokens = tuple(tokenize(text) for text in texts)
     lemmas = tuple(tuple(map(lemmatize_cached, words)) for words in tokens)
     postings, lemma_postings = defaultdict(set), defaultdict(set)
@@ -463,7 +295,7 @@ def build_database(doc_configs, scope="case"):
             postings[word].add(i)
         for word in set(norms):
             lemma_postings[word].add(i)
-    df.attrs.update(scope=scope, indexed_texts=texts, tokens=tokens, lemmas=lemmas,
+    df.attrs.update(indexed_texts=texts, tokens=tokens, lemmas=lemmas,
                     postings=dict(postings), lemma_postings=dict(lemma_postings))
     return df
 
@@ -513,11 +345,8 @@ def semantic_scores(query, df):
 
 
 def _result_from_row(row, score=None, **details):
-    result = {key: row[key] for key in ("case_uid", "source_file", "case_index", "title", "fields", "search_text")}
-    result["case_index"] = int(result["case_index"])
-    for key in ("source_kind", "sheet_name", "row_number"):
-        if key in row:
-            result[key] = row[key]
+    result = {key: row[key] for key in ("case_uid", "source_file", "sheet_name", "row_number", "title", "fields", "search_text")}
+    result["row_number"] = int(result["row_number"])
     if score is not None:
         result["score"] = float(score)
     result.update(details)
@@ -546,17 +375,10 @@ def lexical_scores(query, df, allow_substring=False):
         return result, kinds
     norms = tuple(map(lemmatize_cached, words))
     attrs = df.attrs
-    # Совместимость с DataFrame, построенным старым способом.
-    if "tokens" not in attrs:
-        texts = tuple(df["search_proc"])
-        tokens = tuple(map(tokenize, texts))
-        lemmas = tuple(tuple(map(lemmatize_cached, t)) for t in tokens)
-        candidates = set(range(len(df)))
-    else:
-        tokens, lemmas = attrs["tokens"], attrs["lemmas"]
-        exact = set.intersection(*(attrs["postings"].get(w, set()) for w in set(words)))
-        inflected = set.intersection(*(attrs["lemma_postings"].get(w, set()) for w in set(norms)))
-        candidates = exact | inflected
+    tokens, lemmas = attrs["tokens"], attrs["lemmas"]
+    exact = set.intersection(*(attrs["postings"].get(w, set()) for w in set(words)))
+    inflected = set.intersection(*(attrs["lemma_postings"].get(w, set()) for w in set(norms)))
+    candidates = exact | inflected
     for i in candidates:
         if _contains_phrase(tokens[i], words):
             result[i], kinds[i] = 3.0, "Фраза целиком"
@@ -565,7 +387,7 @@ def lexical_scores(query, df, allow_substring=False):
         elif not (Counter(norms) - Counter(lemmas[i])):
             result[i], kinds[i] = 1.0, "Словоформы"
     if allow_substring:
-        texts = attrs.get("indexed_texts", tuple(df["search_proc"]))
+        texts = attrs["indexed_texts"]
         for i, text in enumerate(texts):
             if result[i] == 0 and preprocess(query) in preprocess(text):
                 result[i], kinds[i] = 0.3, "Часть слова (слабый сигнал)"
