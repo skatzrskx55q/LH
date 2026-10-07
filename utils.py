@@ -8,7 +8,8 @@ import zipfile
 from collections import Counter, defaultdict
 from datetime import date, datetime, time
 from io import BytesIO
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,39 @@ MAX_XLSX_CELLS = 300000
 TITLE_ALIASES = {"фраза", "запрос", "обращение", "вопрос", "заголовок", "phrase", "query", "title"}
 DATE_ALIASES = {"дата", "date", "дата обращения", "дата создания"}
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+DEFAULT_XLSX_URL = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/example_cases.xlsx"
+
+
+def github_xlsx_url(value):
+    if not safe_http_url(value):
+        raise ValueError("Некорректная ссылка XLSX.")
+    parts = urlsplit(value)
+    path = parts.path
+    if parts.hostname == "github.com":
+        chunks = path.strip("/").split("/")
+        if len(chunks) < 5 or chunks[2] != "blob":
+            raise ValueError("Нужна ссылка GitHub на файл XLSX.")
+        path = "/" + "/".join(chunks[:2] + chunks[3:])
+    elif parts.hostname != "raw.githubusercontent.com":
+        raise ValueError("Разрешены только XLSX из GitHub.")
+    if parts.scheme != "https" or parts.port not in (None, 443) or not path.lower().endswith(".xlsx"):
+        raise ValueError("Нужна HTTPS-ссылка на .xlsx.")
+    return urlunsplit(("https", "raw.githubusercontent.com", path, "", ""))
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=8)
+def fetch_github_xlsx(url=DEFAULT_XLSX_URL):
+    class SafeRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return super().redirect_request(req, fp, code, msg, headers, github_xlsx_url(newurl))
+    url = github_xlsx_url(url)
+    opener = build_opener(SafeRedirect())
+    request = Request(url, headers={"User-Agent": "AnnotatorExcel/1.0"})
+    with opener.open(request, timeout=30) as response:
+        content = response.read(MAX_XLSX_BYTES + 1)
+    if len(content) > MAX_XLSX_BYTES:
+        raise ValueError("Размер GitHub-книги превышает 10 МБ.")
+    return content
 
 
 @st.cache_resource(show_spinner=False)
@@ -177,7 +211,8 @@ def read_xlsx(content):
             while rows and not any(excel_value(v) for v in rows[-1]):
                 rows.pop()
             sheets[ws.title] = {"rows": tuple(rows), "header_row": suggest_header_row(rows),
-                               "missing_formulas": missing, "error_cells": errors}
+                               "missing_formulas": missing, "error_cells": errors,
+                               "visible": ws.sheet_state == "visible"}
         return sheets
     finally:
         formulas.close()
@@ -261,7 +296,8 @@ def parse_xlsx_cases(cfg):
         if not any(cells[c] for c in search_cols):
             continue
         title = (cells.get(title_col, "") if title_col else "") or f"Строка {row_number}"
-        text = "\n".join(f"{columns[c]}: {cells[c]}" for c in search_cols if cells[c])
+        # В индекс идут только значения: названия колонок не создают совпадения.
+        text = "\n".join(cells[c] for c in search_cols if cells[c])
         uid = f'{cfg.get("source_id", cfg["name"])}::sheet:{sheet_id}::row:{row_number}'
         cases.append({"case_uid": uid, "source_file": cfg["name"], "sheet_name": cfg["sheet_name"],
                       "row_number": row_number, "title": title, "search_text": text,
@@ -296,8 +332,34 @@ def build_database(workbook_configs):
         for word in set(norms):
             lemma_postings[word].add(i)
     df.attrs.update(indexed_texts=texts, tokens=tokens, lemmas=lemmas,
-                    postings=dict(postings), lemma_postings=dict(lemma_postings))
+                    postings=dict(postings), lemma_postings=dict(lemma_postings),
+                    term_counts=tuple(Counter(words) for words in lemmas),
+                    doc_lengths=np.asarray([len(words) for words in lemmas], dtype=np.float64))
     return df
+
+
+def automatic_configs(sheets, name="example_cases.xlsx", source_id="github-default"):
+    """Строго: первая строка — подписи, первая физическая колонка — поиск."""
+    configs, reports = [], []
+    for sheet_name, sheet in sheets.items():
+        if not sheet.get("visible", True) or not sheet["rows"]:
+            continue
+        table = xlsx_table(sheet, 1)
+        if not table["columns"]:
+            continue
+        first = table["columns"][0]["id"]
+        skipped = sum(not record["cells"][first] for record in table["records"])
+        populated = [r for r in table["records"] if r["cells"][first]]
+        date_or_number = sum(first in r["dates"] or bool(re.fullmatch(r"[\d\s.,+-]+", r["cells"][first])) for r in populated)
+        reports.append({"sheet": sheet_name, "column": table["columns"][0]["label"],
+                        "skipped": skipped, "rows": len(populated),
+                        "nontext": bool(populated) and date_or_number / len(populated) >= 0.5,
+                        "header_warning": sheet["header_row"] != 1,
+                        "missing_formulas": sheet["missing_formulas"], "error_cells": sheet["error_cells"]})
+        configs.append({"kind": "xlsx", "name": name, "source_id": source_id, "sheet_name": sheet_name,
+                        "table": table, "title_column": first, "search_columns": [first],
+                        "display_columns": [c["id"] for c in table["columns"]]})
+    return configs, reports
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -367,69 +429,76 @@ def _contains_phrase(words, query_words):
                for start in range(len(words) - len(query_words) + 1))
 
 
-def lexical_scores(query, df, allow_substring=False):
-    result = np.zeros(len(df), dtype=np.float32)
-    kinds = {}
-    words = tokenize(query)
+def lexical_scores(query, df, k1=1.2, b=0.75):
+    """BM25 с лемматизацией: OR по словам запроса, без поиска частей слов."""
+    if k1 <= 0 or not 0 <= b <= 1:
+        raise ValueError("Некорректные параметры BM25.")
+    result = np.zeros(len(df), dtype=np.float64)
+    words = set(map(lemmatize_cached, tokenize(query)))
     if not words or df.empty:
-        return result, kinds
-    norms = tuple(map(lemmatize_cached, words))
+        return result, {}
     attrs = df.attrs
-    tokens, lemmas = attrs["tokens"], attrs["lemmas"]
-    exact = set.intersection(*(attrs["postings"].get(w, set()) for w in set(words)))
-    inflected = set.intersection(*(attrs["lemma_postings"].get(w, set()) for w in set(norms)))
-    candidates = exact | inflected
-    for i in candidates:
-        if _contains_phrase(tokens[i], words):
-            result[i], kinds[i] = 3.0, "Фраза целиком"
-        elif not (Counter(words) - Counter(tokens[i])):
-            result[i], kinds[i] = 2.0, "Все слова"
-        elif not (Counter(norms) - Counter(lemmas[i])):
-            result[i], kinds[i] = 1.0, "Словоформы"
-    if allow_substring:
-        texts = attrs["indexed_texts"]
-        for i, text in enumerate(texts):
-            if result[i] == 0 and preprocess(query) in preprocess(text):
-                result[i], kinds[i] = 0.3, "Часть слова (слабый сигнал)"
-    return result, kinds
-
-
-def search_bundle(query, df, top_k=5, threshold=0.5, semantic_weight=0.65,
-                  allow_substring=False, use_semantic=True):
-    if not 0 <= semantic_weight <= 1 or not -1 <= threshold <= 1:
-        raise ValueError("Некорректные параметры поиска.")
-    lex, kinds = lexical_scores(query, df, allow_substring)
-    sem = semantic_scores(query, df) if use_semantic else None
-    hybrid, semantic, lexical = [], [], []
-    for i in range(len(df)):
-        lscore = float(lex[i])
-        sscore = float(sem[i]) if sem is not None else None
-        if lscore > 0:
-            lexical.append(_result_from_row(df.iloc[i], lscore, match_type=kinds[i]))
-        if sscore is not None and sscore >= threshold:
-            semantic.append(_result_from_row(df.iloc[i], sscore))
-        if not (lscore > 0 or (sscore is not None and sscore >= threshold)):
+    lengths = attrs["doc_lengths"]
+    avg_length = max(float(lengths.mean()), 1.0)
+    for word in words:
+        matching = attrs["lemma_postings"].get(word, set())
+        if not matching:
             continue
-        if sem is None:
-            combined = lscore / 3
-        else:
-            combined = semantic_weight * max(0, sscore) + (1 - semantic_weight) * lscore / 3
-        if lscore == 3:
-            combined += 0.15
-        hybrid.append(_result_from_row(df.iloc[i], combined, semantic_score=sscore,
-                      lexical_score=lscore, match_type=kinds.get(i, "Семантика")))
-    return {"hybrid": deduplicate_results(hybrid, top_k),
-            "semantic": deduplicate_results(semantic, top_k),
-            "lexical": deduplicate_results(lexical, top_k)}
+        idf = math.log1p((len(df) - len(matching) + 0.5) / (len(matching) + 0.5))
+        for i in matching:
+            tf = attrs["term_counts"][i][word]
+            result[i] += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * lengths[i] / avg_length))
+    return result, {i: "BM25" for i in np.flatnonzero(result > 0)}
 
 
-def semantic_search(query, df, top_k=5, threshold=0.5):
-    return search_bundle(query, df, top_k, threshold)["semantic"]
+def search_bundle(query, df, top_k=5, threshold=0.5, search_type="hybrid",
+                  bm25_k1=1.2, bm25_b=0.75, rrf_k=60, candidate_pool=100):
+    if search_type not in {"hybrid", "semantic", "lexical"}:
+        raise ValueError("Неизвестный тип поиска.")
+    if not -1 <= threshold <= 1 or rrf_k < 1 or top_k < 1 or candidate_pool < 1:
+        raise ValueError("Некорректные параметры поиска.")
+    output = {"hybrid": [], "semantic": [], "lexical": []}
+    if df.empty or not tokenize(query):
+        return output
+    lexical, semantic = [], []
+    if search_type in {"hybrid", "lexical"}:
+        scores, _ = lexical_scores(query, df, bm25_k1, bm25_b)
+        lexical = [_result_from_row(df.iloc[i], score, lexical_score=float(score), match_type="BM25")
+                   for i, score in enumerate(scores) if score > 0]
+        lexical = deduplicate_results(lexical, len(df))
+    if search_type in {"hybrid", "semantic"}:
+        scores = semantic_scores(query, df)
+        if scores is None:
+            raise RuntimeError("Семантический индекс недоступен.")
+        semantic = [_result_from_row(df.iloc[i], score, semantic_score=float(score), match_type="Семантика")
+                    for i, score in enumerate(scores) if score >= threshold]
+        semantic = deduplicate_results(semantic, len(df))
+    output["lexical"] = lexical[:top_k]
+    output["semantic"] = semantic[:top_k]
+    if search_type != "hybrid":
+        return output
+    pool_size = max(candidate_pool, top_k)
+    fused = {}
+    for kind, results in (("lexical", lexical), ("semantic", semantic)):
+        for rank, item in enumerate(results[:pool_size], 1):
+            entry = fused.setdefault(item["case_uid"], {**item, "score": 0.0,
+                                     "lexical_score": None, "semantic_score": None,
+                                     "lexical_rank": None, "semantic_rank": None,
+                                     "match_type": "RRF"})
+            entry["score"] += 1.0 / (rrf_k + rank)
+            entry[kind + "_score"] = item["score"]
+            entry[kind + "_rank"] = rank
+    output["hybrid"] = deduplicate_results(list(fused.values()), top_k)
+    return output
 
 
 def keyword_search(query, df, top_k=5):
-    return search_bundle(query, df, top_k, use_semantic=False)["lexical"]
+    return search_bundle(query, df, top_k, search_type="lexical")["lexical"]
 
 
-def hybrid_search(query, df, top_k=5, threshold=0.5, semantic_weight=0.65):
-    return search_bundle(query, df, top_k, threshold, semantic_weight)["hybrid"]
+def semantic_search(query, df, top_k=5, threshold=0.5):
+    return search_bundle(query, df, top_k, threshold, "semantic")["semantic"]
+
+
+def hybrid_search(query, df, top_k=5, threshold=0.5):
+    return search_bundle(query, df, top_k, threshold, "hybrid")["hybrid"]
