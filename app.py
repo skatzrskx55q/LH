@@ -7,6 +7,7 @@ import streamlit as st
 from utils import (
     attach_embeddings, build_database, search_bundle, safe_http_url,
     read_xlsx, xlsx_table, suggest_xlsx_columns, MAX_XLSX_BYTES,
+    automatic_configs, fetch_github_xlsx, DEFAULT_XLSX_URL,
 )
 
 st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="collapsed")
@@ -162,15 +163,25 @@ def value_html(value):
     return "".join(parts).replace("\n", "<br>")
 
 
+def compact_value(value, limit=300):
+    value = str(value or "")
+    if len(value) <= limit and value.count("\n") < 5:
+        return value_html(value)
+    preview = value[:limit].rstrip()
+    return (f'<details class="cell-details"><summary>{escape(preview)}… '
+            '<span style="color:#c4b5fd">Развернуть полностью</span></summary>'
+            f'<div style="margin-top:12px">{value_html(value)}</div></details>')
+
+
 def field_row(label, value, stacked=False):
     lbl = escape(label)
     val = str(value or "—")
-    if "интент" in str(label).casefold() and "→" in val:
+    if len(val) <= 300 and val.count("\n") < 5 and "интент" in str(label).casefold() and "→" in val:
         badges = '<span class="intent-arrow">→</span>'.join(
             f'<span class="intent-badge">{escape(p.strip())}</span>' for p in val.split("→"))
         body = f'<div class="intent-container">{badges}</div>'
     else:
-        body = f'<div class="data-value">{value_html(val)}</div>'
+        body = f'<div class="data-value">{compact_value(val)}</div>'
     label_html = f'<div class="data-label">{lbl}</div>' if lbl else ""
     return f'<div class="data-row{" stacked" if stacked or not lbl else ""}">{label_html}{body}</div>'
 
@@ -178,7 +189,7 @@ def field_row(label, value, stacked=False):
 def render_card(item, rank, show_score=True, is_best=False):
     parts = [f'<div class="modern-card{" is-best" if is_best else ""}">',
              f'<div class="card-header"><div class="card-rank">{rank}</div>',
-             f'<div class="card-title">{escape(item["title"])}</div></div>',
+             f'<div class="card-title">{compact_value(item["title"], 180)}</div></div>',
              f'<div style="color:#a1a1aa;font-size:12px;margin-bottom:12px">Источник: {escape(item["source_file"])} · лист «{escape(item["sheet_name"])}» · строка {int(item["row_number"])}</div>']
     if item.get("fields"):
         parts.append('<div class="data-grid">')
@@ -188,10 +199,13 @@ def render_card(item, rank, show_score=True, is_best=False):
         parts.append('</div>')
     if show_score and "score" in item:
         parts.append(f'<div class="score-pill">Рейтинг: {item["score"]:.3f}</div>')
-        if "lexical_score" in item:
+        if "lexical_score" in item or "semantic_score" in item:
             sem = item.get("semantic_score")
             detail = f'Семантика: {sem:.3f} · ' if sem is not None else ""
-            detail += f'Текст: {item["lexical_score"]:.1f} · {item.get("match_type", "")}'
+            lexical = item.get("lexical_score")
+            if lexical is not None:
+                detail += f'BM25: {lexical:.3f} · '
+            detail += item.get("match_type", "")
             parts.append(f'<div style="color:#a1a1aa;font-size:12px;margin-top:8px">{escape(detail)}</div>')
     parts.append('</div>')
     return "".join(parts)
@@ -201,7 +215,7 @@ def render_results(title, items, total, show_scores=True, icon="🔍"):
     parts = ['<div class="app-container">',
              f'<div class="stats-panel"><div class="stats-title">{icon} {escape(title)}</div><div class="stats-badge">Показано {len(items)} · в базе {total}</div></div>']
     if not items:
-        parts.append('<div class="modern-card">Ничего не найдено. Попробуйте другой запрос или уменьшите порог семантики.</div>')
+        parts.append('<div class="modern-card">Ничего не найдено. Попробуйте другой запрос или тип поиска.</div>')
     for i, item in enumerate(items, 1):
         parts.append(render_card(item, i, show_scores, i == 1))
     parts.append('</div>')
@@ -299,50 +313,86 @@ def configure_xlsx(doc, sid):
     return configs
 
 
+def github_book():
+    content = fetch_github_xlsx(DEFAULT_XLSX_URL)
+    return {"name": "example_cases.xlsx", "sheets": read_xlsx(content),
+            "content_stamp": hashlib.sha256(content).hexdigest()[:16]}
+
+
 def main():
     st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center;color:#f4f4f5"><h1>Помощник разметчика</h1><p>Поиск по Excel-таблицам и сопоставление интентов</p></div>', unsafe_allow_html=True)
-    query_col, count_col = st.columns([4, 1])
+    st.markdown('<style>.cell-details summary{cursor:pointer;white-space:pre-wrap;overflow-wrap:anywhere}.cell-details[open] summary{color:#a1a1aa}.cell-details>div{white-space:normal;overflow-wrap:anywhere}</style>', unsafe_allow_html=True)
+    st.markdown('<div style="text-align:center;color:#f4f4f5"><h1>Помощник разметчика</h1><p>Поиск по Excel-таблицам</p></div>', unsafe_allow_html=True)
+    mode = st.radio("Режим работы", ["Автоматический", "Ручной"], horizontal=True, key="work_mode")
+    query_col, type_col, count_col = st.columns([4, 2, 1])
     with query_col:
         query = st.text_input("Поисковый запрос", placeholder="Например: изменить дату платежа", key="query")
+    with type_col:
+        label = st.selectbox("Тип поиска", ["Гибридный", "Семантический", "Лексический (BM25)"], key="search_type")
     with count_col:
-        top_k = st.number_input("Результатов", min_value=1, max_value=20, value=5)
+        top_k = int(st.number_input("Результатов", min_value=1, max_value=20, value=5))
+    search_type = {"Гибридный": "hybrid", "Семантический": "semantic", "Лексический (BM25)": "lexical"}[label]
     configs = []
-    with st.expander("⚙️ Excel-книги, листы и колонки", expanded=not st.session_state.get("sources_ready", False)):
-        uploads = st.file_uploader("Excel-книги (.xlsx)", type=["xlsx"], accept_multiple_files=True)
-        st.caption("До 10 МБ на книгу. Можно загрузить несколько книг и выбрать несколько листов.")
-        books = {}
-        for index, file in enumerate(uploads or []):
-            try:
-                if not file.name.casefold().endswith(".xlsx"):
-                    raise ValueError("Поддерживаются только книги .xlsx.")
-                content = file.getvalue()
-                if len(content) > MAX_XLSX_BYTES:
-                    raise ValueError("Размер книги превышает 10 МБ.")
-                sid = source_key("local", f"{file.name}:{index}")
-                books[sid] = {"name": file.name, "sheets": read_xlsx(content),
-                              "content_stamp": hashlib.sha256(content).hexdigest()[:16]}
-            except Exception as exc:
-                st.warning(f"{file.name}: {exc}")
-        duplicate_names = pd.Series([b["name"] for b in books.values()]).value_counts().to_dict() if books else {}
-        def book_label(sid):
-            name = books[sid]["name"]
-            return f"{name} · {sid}" if duplicate_names[name] > 1 else name
-        active = st.multiselect("Книги для работы", list(books), default=list(books), format_func=book_label)
-        for sid in active:
-            st.subheader(book_label(sid))
-            configs.extend(configure_xlsx(books[sid], sid))
-        st.session_state["sources_ready"] = bool(configs)
-    with st.expander("Параметры поиска", expanded=False):
-        enable_semantic = st.checkbox("Использовать семантическую модель", value=True)
-        threshold = st.slider("Порог семантического сходства", 0.0, 1.0, 0.5, 0.01,
-                              help="Начальное значение, а не измеренный оптимум. Подберите его на размеченных запросах.")
-        weight = st.slider("Вес семантики в гибридном рейтинге", 0.0, 1.0, 0.65, 0.05,
-                           help="Остальной вес приходится на текстовые совпадения. Совпадение фразы целиком получает дополнительный бонус.")
-        substring = st.checkbox("Учитывать совпадение части слова (слабый сигнал)", value=False)
-        diagnostics = st.checkbox("Показать отдельные выдачи и ID строк", value=False)
+    threshold, k1, b, rrf_k, pool, diagnostics = 0.5, 1.2, 0.75, 60, 100, False
+    if mode == "Автоматический":
+        try:
+            doc = github_book()
+            configs, reports = automatic_configs(doc["sheets"], doc["name"], source_key("github", DEFAULT_XLSX_URL))
+            st.caption("Таблица загружена из GitHub. Поиск — только по первой колонке каждого видимого листа. Остальные поля показываются в карточке.")
+            for report in reports:
+                st.caption(f'{report["sheet"]}: поиск по «{report["column"]}» · строк: {report["rows"]} · пропущено с пустой первой ячейкой: {report["skipped"]}')
+                if report["nontext"]:
+                    st.warning(f'На листе «{report["sheet"]}» в первой колонке преимущественно даты или числа. Поиск всё равно идёт по ней. Для выбора другой колонки перейдите в ручной режим.')
+                if report["header_warning"]:
+                    st.warning(f'На листе «{report["sheet"]}» заголовки, возможно, ниже первой строки. Автоматический режим использует строку 1; другую можно выбрать в ручном режиме.')
+                if report["missing_formulas"] or report["error_cells"]:
+                    st.warning(f'Лист «{report["sheet"]}»: пустых результатов формул — {report["missing_formulas"]}, ошибок ячеек — {report["error_cells"]}. Эти ячейки считаются пустыми.')
+        except Exception as exc:
+            st.error(f"Не удалось загрузить таблицу из GitHub: {exc}")
+            st.info("Попробуйте позже или откройте ручной режим и загрузите свою XLSX-книгу.")
+            return
+    else:
+        with st.expander("⚙️ Ручной режим — источники, колонки и параметры поиска", expanded=True):
+            uploads = st.file_uploader("Свои Excel-книги (.xlsx), необязательно", type=["xlsx"], accept_multiple_files=True, key="manual_uploads")
+            st.caption("Без загрузки используется GitHub-таблица. Свои файлы заменяют её только в ручном режиме.")
+            books = {}
+            if uploads:
+                for index, file in enumerate(uploads):
+                    try:
+                        if not file.name.casefold().endswith(".xlsx"):
+                            raise ValueError("Поддерживаются только .xlsx.")
+                        content = file.getvalue()
+                        if len(content) > MAX_XLSX_BYTES:
+                            raise ValueError("Размер книги превышает 10 МБ.")
+                        sid = source_key("local", f"{file.name}:{index}")
+                        books[sid] = {"name": file.name, "sheets": read_xlsx(content),
+                                      "content_stamp": hashlib.sha256(content).hexdigest()[:16]}
+                    except Exception as exc:
+                        st.warning(f"{file.name}: {exc}")
+            else:
+                if st.button("Обновить GitHub-таблицу", key="refresh_github"):
+                    fetch_github_xlsx.clear()
+                try:
+                    books[source_key("github", DEFAULT_XLSX_URL)] = github_book()
+                except Exception as exc:
+                    st.warning(f"GitHub-таблица недоступна: {exc}. Можно загрузить свою книгу выше.")
+            def book_label(sid):
+                name = books[sid]["name"]
+                duplicate = sum(book["name"] == name for book in books.values()) > 1
+                return f"{name} · {sid}" if duplicate else name
+            active = st.multiselect("Книги для работы", list(books), default=list(books), format_func=book_label, key="manual_books")
+            for sid in active:
+                st.subheader(book_label(sid))
+                configs.extend(configure_xlsx(books[sid], sid))
+            threshold = st.slider("Порог семантического сходства", 0.0, 1.0, 0.5, 0.01,
+                                  help="Действует в семантическом и гибридном поиске. Значение нужно проверить на реальных запросах.")
+            k1 = st.slider("BM25: насыщение частоты k1", 0.1, 3.0, 1.2, 0.1)
+            b = st.slider("BM25: учёт длины текста b", 0.0, 1.0, 0.75, 0.05)
+            rrf_k = int(st.number_input("RRF: константа объединения", min_value=1, max_value=200, value=60))
+            pool = int(st.number_input("Кандидатов из каждого рейтинга", min_value=20, max_value=1000, value=100))
+            diagnostics = st.checkbox("Показать отдельные выдачи и ID строк", value=False)
     if not configs:
-        st.info("Загрузите XLSX, выберите листы и настройте поисковые колонки.")
+        st.info("Нет настроенных листов для поиска.")
         return
     try:
         df = build_database(configs)
@@ -350,40 +400,43 @@ def main():
         st.error(f"Ошибка обработки таблиц: {exc}")
         return
     if df.empty:
-        st.warning("Нет строк для поиска. Проверьте строку заголовков, поисковые колонки и фильтр дат.")
+        st.warning("Нет строк для поиска. Проверьте первую колонку или настройки ручного режима.")
         return
     total = int(df["case_uid"].nunique())
-    st.caption(f'В базе: {total} строк · листов: {len(configs)}')
+    st.caption(f"В базе: {total} строк · листов: {len(configs)}")
     if not query.strip():
         return
-    semantic_ok = enable_semantic
-    if semantic_ok:
-        try:
+    actual_type = search_type
+    try:
+        if search_type != "lexical":
             with st.spinner("Подготовка семантического поиска…"):
                 attach_embeddings(df)
-        except Exception as exc:
-            semantic_ok = False
-            st.warning(f"Семантическая модель недоступна. Работает текстовый поиск. Причина: {exc}")
-    try:
         with st.spinner("Поиск…"):
-            results = search_bundle(query, df, int(top_k), threshold, weight, substring, semantic_ok)
+            results = search_bundle(query, df, top_k, threshold, search_type, k1, b, rrf_k, pool)
     except Exception as exc:
-        if not semantic_ok:
-            st.error(f"Ошибка поиска: {exc}")
+        if search_type != "hybrid":
+            st.error(f"Выбранный поиск недоступен: {exc}")
+            if search_type == "semantic":
+                st.info("Для текстового поиска выберите «Лексический (BM25)».")
             return
-        st.warning(f"Семантический поиск недоступен: {exc}. Показаны текстовые результаты.")
-        semantic_ok = False
-        results = search_bundle(query, df, int(top_k), threshold, weight, substring, False)
-    render_results("Гибридный поиск" if semantic_ok else "Текстовый поиск", results["hybrid"], total)
-    st.caption("Рейтинг служит для сортировки и не является вероятностью правильного ответа.")
+        st.warning(f"Семантическая часть недоступна: {exc}. Показаны только результаты BM25.")
+        actual_type = "lexical"
+        try:
+            results = search_bundle(query, df, top_k, threshold, "lexical", k1, b, rrf_k, pool)
+        except Exception as fallback_exc:
+            st.error(f"Лексический поиск недоступен: {fallback_exc}")
+            return
+    titles = {"hybrid": "Гибридный поиск · RRF", "semantic": "Семантический поиск", "lexical": "Лексический поиск · BM25"}
+    render_results(titles[actual_type], results[actual_type], total)
+    st.caption("Баллы BM25, семантики и RRF имеют разные шкалы и не являются вероятностью правильного ответа.")
     if diagnostics:
-        with st.expander("Диагностика", expanded=True):
+        st.subheader("Диагностика")
+        if search_type == "hybrid" and actual_type == "hybrid":
+            render_results("BM25", results["lexical"], total)
             render_results("Семантика", results["semantic"], total, icon="✨")
-            render_results("Точные фразы, слова и словоформы", results["lexical"], total, icon="🎯")
-            catalog = df[["case_uid", "source_file", "sheet_name", "row_number", "title"]].drop_duplicates("case_uid")
-            st.dataframe(catalog, use_container_width=True, hide_index=True)
-            st.download_button("Скачать ID строк для оценки", catalog.to_csv(index=False).encode("utf-8-sig"),
-                               "row_catalog.csv", "text/csv")
+        catalog = df[["case_uid", "source_file", "sheet_name", "row_number", "title"]]
+        st.dataframe(catalog, use_container_width=True, hide_index=True)
+        st.download_button("Скачать ID строк", catalog.to_csv(index=False).encode("utf-8-sig"), "row_catalog.csv", "text/csv")
 
 
 if __name__ == "__main__":
