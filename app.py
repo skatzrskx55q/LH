@@ -1,441 +1,435 @@
+"""Чтение XLSX, индекс строк и гибридный поиск. Python 3.11–3.12."""
+import functools
 import hashlib
-import html
-from urllib.parse import unquote, urlsplit
+import math
+import re
+import threading
+import zipfile
+from collections import Counter, defaultdict
+from datetime import date, datetime, time
+from io import BytesIO
+from urllib.parse import urlsplit
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from utils import (
-    attach_embeddings, build_database, decode_text_bytes, fetch_url_text,
-    search_bundle, safe_http_url, MAX_DOCUMENT_BYTES, MODEL_ID,
-    read_xlsx, xlsx_table, suggest_xlsx_columns, MAX_XLSX_BYTES,
-)
-
-st.set_page_config(page_title="Помощник разметчика", layout="centered", page_icon="⚡", initial_sidebar_state="collapsed")
-
-DARK_SaaS_CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif !important;
-}
-
-header[data-testid="stHeader"] { display: none !important; }
-[data-testid="stSidebar"], [data-testid="collapsedControl"], [data-testid="stSidebarCollapsedControl"] {
-    display: none !important;
-}
-
-[data-testid="stAppViewContainer"] {
-    background: radial-gradient(circle at 15% 20%, rgba(67, 40, 116, 0.25) 0%, transparent 50%),
-                radial-gradient(circle at 85% 80%, rgba(29, 78, 216, 0.15) 0%, transparent 50%),
-                #09090b !important;
-    background-size: 150% 150% !important;
-    animation: bg-shift 20s ease-in-out infinite alternate !important;
-}
-
-@keyframes bg-shift {
-    0% { background-position: 0% 0%; }
-    100% { background-position: 100% 100%; }
-}
-
-.block-container {
-    padding-top: 3rem !important;
-    padding-bottom: 4rem !important;
-    max-width: 850px !important;
-}
-
-/* EXPANDER НАСТРОЕК */
-[data-testid="stExpander"] {
-    background: rgba(24, 24, 27, 0.45) !important;
-    border: 1px solid rgba(63, 63, 70, 0.4) !important;
-    border-radius: 16px !important;
-    backdrop-filter: blur(10px) !important;
-    margin-bottom: 2rem !important;
-    overflow: hidden;
-}
-[data-testid="stExpander"] summary {
-    background: transparent !important;
-    color: #f4f4f5 !important;
-    font-weight: 600 !important;
-    font-size: 15px !important;
-    padding: 16px 20px !important;
-    transition: color 0.2s ease;
-}
-[data-testid="stExpander"] summary:hover { color: #8b5cf6 !important; }
-[data-testid="stExpander"] svg { fill: currentColor !important; }
-
-/* КАСТОМИЗАЦИЯ MULTISELECT TAGS */
-span[data-baseweb="tag"] {
-    background-color: rgba(139, 92, 246, 0.15) !important;
-    color: #d8b4fe !important;
-    border: 1px solid rgba(139, 92, 246, 0.3) !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-}
-span[data-baseweb="tag"] svg { fill: #d8b4fe !important; }
-
-/* ПОЛЯ ВВОДА */
-div[data-baseweb="input"] > div, div[data-baseweb="base-input"], div[data-baseweb="textarea"] > div, div[data-baseweb="select"] > div {
-    background-color: rgba(9, 9, 11, 0.6) !important;
-    border: 1px solid rgba(63, 63, 70, 0.5) !important;
-    border-radius: 12px !important;
-    color: #f4f4f5 !important;
-    backdrop-filter: blur(8px);
-}
-div[data-baseweb="input"] > div:focus-within, div[data-baseweb="textarea"] > div:focus-within {
-    border-color: #8b5cf6 !important;
-    box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.25) !important;
-    background-color: rgba(9, 9, 11, 0.8) !important;
-}
-div[data-testid="stTextInput"] label p, div[data-testid="stNumberInput"] label p, div[data-testid="stTextArea"] label p, div[data-testid="stFileUploader"] label p, div[data-testid="stSelectbox"] label p {
-    color: #a1a1aa !important;
-    font-size: 12px !important;
-    font-weight: 600 !important;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 4px;
-    white-space: normal;
-}
-
-/* КОНТЕЙНЕР ПРИЛОЖЕНИЯ */
-.app-container { color: #f4f4f5; margin-bottom: 2rem; }
-
-.stats-panel {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 16px 20px; margin: 2rem 0 1.5rem;
-    background: rgba(24, 24, 27, 0.4); border: 1px solid rgba(63, 63, 70, 0.4);
-    border-radius: 16px; backdrop-filter: blur(12px);
-}
-.stats-title { font-size: 18px; font-weight: 700; color: #ffffff; display: flex; align-items: center; gap: 8px; }
-.stats-badge { background: rgba(39, 39, 42, 0.6); padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; color: #d4d4d8; border: 1px solid rgba(82, 82, 91, 0.5); }
-
-/* КАРТОЧКИ (GLASSMORPHISM) */
-.modern-card {
-    background: rgba(24, 24, 27, 0.45); border: 1px solid rgba(63, 63, 70, 0.4);
-    border-radius: 16px; padding: 20px; margin-bottom: 16px;
-    transition: all 0.3s ease; position: relative; overflow: hidden; backdrop-filter: blur(10px);
-}
-.modern-card:hover { transform: translateY(-3px); border-color: rgba(139, 92, 246, 0.4); box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5); background: rgba(24, 24, 27, 0.65); }
-.modern-card.is-best { border-color: rgba(139, 92, 246, 0.6); background: linear-gradient(180deg, rgba(139, 92, 246, 0.08) 0%, rgba(24, 24, 27, 0.5) 100%); }
-.modern-card.is-best::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, #8b5cf6, #3b82f6); }
-
-.card-header { display: flex; gap: 16px; margin-bottom: 16px; }
-.card-rank { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; background: rgba(9, 9, 11, 0.6); border: 1px solid rgba(63, 63, 70, 0.5); border-radius: 10px; font-weight: 800; font-size: 15px; color: #f4f4f5; }
-.is-best .card-rank { background: #8b5cf6; color: white; border: none; box-shadow: 0 0 15px rgba(139, 92, 246, 0.4); }
-.card-title { font-size: 17px; font-weight: 600; line-height: 1.4; color: #ffffff; flex: 1; }
-
-.data-grid { display: flex; flex-direction: column; gap: 12px; background: rgba(9, 9, 11, 0.3); border: 1px solid rgba(63, 63, 70, 0.3); border-radius: 12px; padding: 16px; }
-.data-row { display: flex; flex-direction: row; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.data-row.stacked { flex-direction: column; align-items: flex-start; gap: 6px; }
-.data-label { font-size: 12px; font-weight: 600; color: #a1a1aa; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
-.data-row:not(.stacked) .data-label::after { content: ":"; }
-
-.data-value { font-size: 14px; color: #e4e4e7; line-height: 1.6; word-break: break-word; width: 100%; }
-
-.intent-container { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 2px; }
-.intent-badge { background: rgba(139, 92, 246, 0.15); border: 1px solid rgba(139, 92, 246, 0.3); color: #d8b4fe; padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 500; line-height: 1.4; }
-.intent-arrow { color: #71717a; font-size: 14px; }
-.score-pill { display: inline-flex; align-items: center; padding: 4px 10px; background: rgba(16, 185, 129, 0.1); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 99px; font-size: 12px; font-weight: 700; margin-top: 12px; }
-@media (prefers-reduced-motion: reduce) { [data-testid="stAppViewContainer"] { animation: none !important; } .modern-card { transition: none !important; } }
-</style>
-"""
+MODEL_ID = "skatzR/USER-BGE-M3-MiniLM-L12-v2-Distilled"
+MAX_XLSX_BYTES = 10 * 1024 * 1024
+MAX_XLSX_UNPACKED_BYTES = 50 * 1024 * 1024
+MAX_XLSX_ROWS = 20000
+MAX_XLSX_COLUMNS = 100
+MAX_XLSX_SHEETS = 20
+MAX_XLSX_CELLS = 300000
+TITLE_ALIASES = {"фраза", "запрос", "обращение", "вопрос", "заголовок", "phrase", "query", "title"}
+DATE_ALIASES = {"дата", "date", "дата обращения", "дата создания"}
+TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
-def escape(value):
-    return html.escape(str(value or ""), quote=True)
+@st.cache_resource(show_spinner=False)
+def get_model(model_id=MODEL_ID):
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model_id, trust_remote_code=False)
 
 
-def value_html(value):
-    # Ссылки разрешены и в сплошном/ручном режиме, но только http(s).
-    import re
-    value = str(value or "—")
-    parts, last = [], 0
-    for match in re.finditer(r"https?://[^\s<>\"']+", value, re.I):
-        url = match.group().rstrip(".,;!)]}")
-        end = match.start() + len(url)
-        parts.append(escape(value[last:match.start()]))
-        if safe_http_url(url):
-            parts.append(f'<a href="{escape(url)}" target="_blank" rel="noopener noreferrer" style="color:#c4b5fd">{escape(url)}</a>')
-        else:
-            parts.append(escape(url))
-        last = end
-    parts.append(escape(value[last:]))
-    return "".join(parts).replace("\n", "<br>")
+@st.cache_resource(show_spinner=False)
+def model_lock():
+    # Модель и токенизатор используются несколькими сессиями Streamlit.
+    return threading.RLock()
 
 
-def field_row(label, value, stacked=False):
-    lbl = escape(label)
-    val = str(value or "—")
-    if "интент" in str(label).casefold() and "→" in val:
-        badges = '<span class="intent-arrow">→</span>'.join(
-            f'<span class="intent-badge">{escape(p.strip())}</span>' for p in val.split("→"))
-        body = f'<div class="intent-container">{badges}</div>'
-    else:
-        body = f'<div class="data-value">{value_html(val)}</div>'
-    label_html = f'<div class="data-label">{lbl}</div>' if lbl else ""
-    return f'<div class="data-row{" stacked" if stacked or not lbl else ""}">{label_html}{body}</div>'
+@st.cache_resource(show_spinner=False)
+def get_morph():
+    import pymorphy3
+    return pymorphy3.MorphAnalyzer()
 
 
-def render_card(item, rank, show_score=True, is_best=False):
-    if item.get("source_kind") == "xlsx":
-        location = f'лист «{item["sheet_name"]}» · строка {int(item["row_number"])}'
-    else:
-        location = f'кейс {int(item["case_index"])}'
-    parts = [f'<div class="modern-card{" is-best" if is_best else ""}">',
-             f'<div class="card-header"><div class="card-rank">{rank}</div>',
-             f'<div class="card-title">{escape(item["title"])}</div></div>',
-             f'<div style="color:#a1a1aa;font-size:12px;margin-bottom:12px">Источник: {escape(item["source_file"])} · {escape(location)}</div>']
-    if item.get("fields"):
-        parts.append('<div class="data-grid">')
-        for field in item["fields"]:
-            value = field.get("value", "")
-            parts.append(field_row(field.get("label", ""), value, len(value) > 80 or "\n" in value))
-        parts.append('</div>')
-    if show_score and "score" in item:
-        parts.append(f'<div class="score-pill">Рейтинг: {item["score"]:.3f}</div>')
-        if "lexical_score" in item:
-            sem = item.get("semantic_score")
-            detail = f'Семантика: {sem:.3f} · ' if sem is not None else ""
-            detail += f'Текст: {item["lexical_score"]:.1f} · {item.get("match_type", "")}'
-            parts.append(f'<div style="color:#a1a1aa;font-size:12px;margin-top:8px">{escape(detail)}</div>')
-    parts.append('</div>')
-    return "".join(parts)
+def normalize_spaces(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def render_results(title, items, total, show_scores=True, icon="🔍"):
-    parts = ['<div class="app-container">',
-             f'<div class="stats-panel"><div class="stats-title">{icon} {escape(title)}</div><div class="stats-badge">Показано {len(items)} · в базе {total}</div></div>']
-    if not items:
-        parts.append('<div class="modern-card">Ничего не найдено. Попробуйте другой запрос или уменьшите порог семантики.</div>')
-    for i, item in enumerate(items, 1):
-        parts.append(render_card(item, i, show_scores, i == 1))
-    parts.append('</div>')
-    st.markdown("".join(parts), unsafe_allow_html=True)
+def preprocess(text):
+    return normalize_spaces(text).casefold().replace("ё", "е")
 
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=32)
-def cached_fetch_url(url):
-    return fetch_url_text(url)
+
+def tokenize(text):
+    return tuple(TOKEN_RE.findall(preprocess(text)))
 
 
-MODE_MAP = {"Авто": "auto", "Ручной": "custom", "Сплошной": "none"}
-DEFAULT_GITHUB = "https://raw.githubusercontent.com/skatzrskx55q/LH/main/Документ 3.txt"
+@functools.lru_cache(maxsize=50000)
+def lemmatize_cached(word):
+    return get_morph().parse(word)[0].normal_form if word.isalpha() else word
 
 
-def source_key(kind, value):
-    return kind + ":" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+def lemmatize(word):
+    return lemmatize_cached(word)
 
 
-def configure_xlsx(doc, sid):
-    """Независимые настройки каждого выбранного листа, сохранённые в сессии."""
-    sheets = doc["sheets"]
-    widget_source = sid + ":" + doc.get("content_stamp", "")
-    selected = st.multiselect("Листы для поиска", list(sheets), default=list(sheets)[:1], key=f"sheets_{widget_source}")
-    configs = []
-    for name in selected:
-        sheet = sheets[name]
-        key = source_key("sheet", widget_source + ":" + name)
-        with st.container(border=True):
-            st.markdown(f"**Лист: {escape(name)}**")
-            if not sheet["rows"]:
-                st.info("Лист пуст.")
-                continue
-            st.caption("Предпросмотр первых 20 строк. Число слева — номер строки в Excel.")
-            preview = pd.DataFrame([[str(v) if v is not None else "" for v in row]
-                                    for row in sheet["rows"][:20]],
-                                   index=range(1, min(20, len(sheet["rows"])) + 1))
-            preview.columns = [f"Колонка {i + 1}" for i in range(len(preview.columns))]
-            st.dataframe(preview, use_container_width=True)
-            header = int(st.number_input("Строка с названиями колонок", min_value=1,
-                          max_value=len(sheet["rows"]), value=sheet["header_row"], step=1, key=f"header_{key}"))
-            table = xlsx_table(sheet, header)
-            columns = table["columns"]
-            if not columns:
-                st.info("Ниже выбранной строки нет данных.")
-                continue
-            # Смена заголовков сбрасывает только зависимые настройки этого листа.
-            key += f"_h{header}"
-            labels = {c["id"]: c["label"] for c in columns}
-            ids = list(labels)
-            suggested = suggest_xlsx_columns(table)
-            if any(not c["original"] for c in columns) or len({c["original"] for c in columns}) < len(columns):
-                st.caption("Пустые заголовки получили название «Колонка N»; повторяющиеся — числовой суффикс.")
-            if sheet["missing_formulas"]:
-                st.warning(f'У {sheet["missing_formulas"]} ячеек с формулами нет сохранённого результата. Они считаются пустыми. Пересчитайте книгу в Excel/LibreOffice и сохраните её.')
-            if sheet["error_cells"]:
-                st.warning(f'Ячейки с ошибками Excel считаются пустыми: {sheet["error_cells"]}.')
-            title_options = [None] + ids
-            title = st.selectbox("Колонка заголовка карточки", title_options,
-                                 index=title_options.index(suggested["title_column"]),
-                                 format_func=lambda c: "Номер строки" if c is None else labels[c],
-                                 key=f"title_{key}")
-            mode = st.radio("Искать в таблице", ["По основной фразе", "По выбранным колонкам", "По всей строке"],
-                            horizontal=True, key=f"search_mode_{key}")
-            if mode == "По основной фразе":
-                search_columns = [title] if title else []
-            elif mode == "По всей строке":
-                search_columns = ids
-            else:
-                search_columns = st.multiselect("Колонки для поиска", ids,
-                                default=suggested["search_columns"], format_func=labels.get, key=f"search_cols_{key}")
-            display_columns = st.multiselect("Колонки для отображения", ids, default=ids,
-                                            format_func=labels.get, key=f"display_{key}",
-                                            help="Заголовок карточки показывается отдельно. Остальные пустые поля скрываются.")
-            st.caption("Поисковые колонки определяют совпадения. Колонки для отображения определяют только содержимое карточки.")
-            display_table = table
-            if st.checkbox("Изменить подписи полей", key=f"rename_{key}"):
-                renamed = []
-                for column in columns:
-                    label = st.text_input(f'Подпись: {column["label"]}', value=column["label"],
-                                          key=f'rename_{key}_{column["id"]}').strip()
-                    renamed.append({**column, "display_label": label or column["label"]})
-                display_table = {**table, "columns": renamed}
-            date_column, date_from, date_to = None, None, None
-            if table["date_columns"] and st.checkbox("Фильтровать по дате", key=f"date_filter_{key}"):
-                date_column = st.selectbox("Колонка даты", table["date_columns"], format_func=labels.get, key=f"date_col_{key}")
-                dates = [r["dates"][date_column] for r in table["records"] if date_column in r["dates"]]
-                c1, c2 = st.columns(2)
-                with c1:
-                    date_from = st.date_input("Дата с", value=min(dates), key=f"from_{key}_{date_column}")
-                with c2:
-                    date_to = st.date_input("Дата по", value=max(dates), key=f"to_{key}_{date_column}")
-                st.caption("Границы включены. Строки без распознанной даты исключаются при включённом фильтре.")
-            if not search_columns:
-                st.warning("Выберите колонку основной фразы или хотя бы одну колонку для поиска.")
-                continue
-            if date_from and date_to and date_from > date_to:
-                st.warning("Дата начала должна быть не позже даты окончания.")
-                continue
-            st.caption(f'Строк данных: {len(table["records"])}. Строки с пустыми поисковыми ячейками не индексируются.')
-            configs.append({"kind": "xlsx", "name": doc["name"], "source_id": sid,
-                            "sheet_name": name, "table": display_table, "title_column": title,
-                            "search_columns": search_columns, "display_columns": display_columns,
-                            "date_column": date_column, "date_from": date_from, "date_to": date_to})
-    return configs
-
-
-def main():
-    st.markdown(DARK_SaaS_CSS, unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center;color:#f4f4f5"><h1>Помощник разметчика</h1><p>Поиск по кейсам и сопоставление интентов</p></div>', unsafe_allow_html=True)
-    query_col, count_col = st.columns([4, 1])
-    with query_col:
-        query = st.text_input("Поисковый запрос", placeholder="Например: изменить дату платежа", key="query")
-    with count_col:
-        top_k = st.number_input("Результатов", min_value=1, max_value=20, value=5)
-    scope_label = st.radio("Поиск в TXT", ["Весь кейс", "Только заголовки"], horizontal=True,
-                          help="Для Excel поисковые колонки настраиваются отдельно на каждом листе в источниках данных.")
-    scope = "case" if scope_label == "Весь кейс" else "title"
-    configs = []
-    with st.expander("⚙️ Источники данных и настройки парсинга", expanded=not st.session_state.get("sources_ready", False)):
-        col_upload, col_urls = st.columns(2)
-        with col_upload:
-            uploads = st.file_uploader("Локальные файлы (.txt, .xlsx)", type=["txt", "xlsx"], accept_multiple_files=True)
-            st.caption("TXT — до 5 МБ, XLSX — до 10 МБ. Можно использовать оба формата одновременно.")
-        with col_urls:
-            urls_text = st.text_area("Прямые ссылки raw.githubusercontent.com на TXT", value=DEFAULT_GITHUB, height=100)
-        if st.button("Обновить документы по ссылкам"):
-            cached_fetch_url.clear()
-        docs = {}
-        for url in dict.fromkeys(u.strip() for u in urls_text.splitlines() if u.strip()):
-            name = "GitHub документ"
-            sid = source_key("github", url)
-            try:
-                name = unquote(urlsplit(url).path.rsplit("/", 1)[-1]) or name
-                text = cached_fetch_url(url)
-                if not text.strip():
-                    raise ValueError("Документ пуст.")
-                docs[sid] = {"name": name, "text": text, "source_id": sid}
-            except Exception as exc:
-                st.warning(f"Не удалось загрузить {name}: {exc}")
-        for index, file in enumerate(uploads or []):
-            try:
-                content = file.getvalue()
-                is_xlsx = file.name.casefold().endswith(".xlsx")
-                limit = MAX_XLSX_BYTES if is_xlsx else MAX_DOCUMENT_BYTES
-                if len(content) > limit:
-                    raise ValueError(f"Размер файла превышает {limit // (1024 * 1024)} МБ.")
-                sid = source_key("local", f"{file.name}:{index}")
-                if is_xlsx:
-                    docs[sid] = {"name": file.name, "sheets": read_xlsx(content), "source_id": sid, "kind": "xlsx",
-                                 "content_stamp": hashlib.sha256(content).hexdigest()[:16]}
-                else:
-                    docs[sid] = {"name": file.name, "text": decode_text_bytes(content), "source_id": sid, "kind": "txt"}
-            except Exception as exc:
-                st.warning(f"{file.name}: {exc}")
-        duplicate_names = pd.Series([d["name"] for d in docs.values()]).value_counts().to_dict() if docs else {}
-        def doc_label(sid):
-            name = docs[sid]["name"]
-            return f"{name} · {sid}" if duplicate_names[name] > 1 else name
-        active = st.multiselect("Документы и книги для работы", list(docs), default=list(docs), format_func=doc_label)
-        for sid in active:
-            if docs[sid].get("kind") == "xlsx":
-                st.subheader(doc_label(sid))
-                configs.extend(configure_xlsx(docs[sid], sid))
-                continue
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                st.caption(doc_label(sid))
-            with c2:
-                choice = st.selectbox("Режим", list(MODE_MAP), key=f"mode_{sid}")
-            prefixes = ""
-            if choice == "Ручной":
-                prefixes = st.text_input("Префиксы через запятую", "Интенты, Дата, Статья, Ссылка", key=f"prefix_{sid}")
-            configs.append({**docs[sid], "mode": MODE_MAP[choice],
-                            "prefixes": [p.strip() for p in prefixes.split(",") if p.strip()]})
-        st.session_state["sources_ready"] = bool(configs)
-    with st.expander("Параметры поиска", expanded=False):
-        enable_semantic = st.checkbox("Использовать семантическую модель", value=True)
-        threshold = st.slider("Порог семантического сходства", 0.0, 1.0, 0.5, 0.01,
-                              help="Начальное значение, а не измеренный оптимум. Подберите его на размеченных запросах.")
-        weight = st.slider("Вес семантики в гибридном рейтинге", 0.0, 1.0, 0.65, 0.05)
-        substring = st.checkbox("Учитывать совпадение части слова (слабый сигнал)", value=False)
-        diagnostics = st.checkbox("Показать отдельные выдачи и ID кейсов", value=False)
-    if not configs:
-        st.info("Загрузите документы и выберите источники для поиска.")
-        return
+def safe_http_url(value):
+    """Проверяет адрес для отображения ссылки; ничего не скачивает."""
+    value = str(value or "").strip(" ")
+    if not value or re.search(r"""[\s\x00-\x1f\x7f<>"'\\]""", value):
+        return None
     try:
-        df = build_database(configs, scope)
+        parts = urlsplit(value)
+        if (parts.scheme.lower() not in {"http", "https"} or not parts.hostname
+                or parts.username is not None or parts.password is not None):
+            return None
+        _ = parts.port  # отклоняет некорректный порт
+        return value
+    except ValueError:
+        return None
+
+
+def excel_value(value):
+    """Сохраняет нули и переносы строк, приводит даты к читаемому виду."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y" if value.time() == time() else "%d.%m.%Y %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, time):
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, bool):
+        return "Да" if value else "Нет"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        if value.is_integer():
+            return str(int(value))
+    return str(value).strip()
+
+
+def excel_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(value.strip(), fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def suggest_header_row(rows):
+    """Предлагает строку заголовков; её всегда можно изменить вручную."""
+    best = (float("-inf"), 1)
+    aliases = TITLE_ALIASES | DATE_ALIASES | {"интент", "интенты", "комментарий", "comment", "intent"}
+    for number, row in enumerate(rows[:50], 1):
+        values = [normalize_spaces(excel_value(v)) for v in row if excel_value(v)]
+        if not values:
+            continue
+        known = sum(preprocess(v) in aliases for v in values)
+        short = sum(len(v) <= 60 for v in values)
+        unique = len(set(preprocess(v) for v in values))
+        score = known * 10 + min(len(values), 10) + short / len(values) + unique / len(values)
+        if score > best[0]:
+            best = (score, number)
+    return best[1]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def read_xlsx(content):
+    """Читает только XLSX. Формулы не вычисляет: берёт сохранённые значения."""
+    from openpyxl import load_workbook
+    if not content or len(content) > MAX_XLSX_BYTES:
+        raise ValueError("Пустой XLSX или размер больше 10 МБ.")
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            if len(archive.infolist()) > 2000 or sum(i.file_size for i in archive.infolist()) > MAX_XLSX_UNPACKED_BYTES:
+                raise ValueError("Книга слишком велика после распаковки (лимит 50 МБ).")
+        formulas = load_workbook(BytesIO(content), read_only=True, data_only=False, keep_links=False)
+    except ValueError:
+        raise
     except Exception as exc:
-        st.error(f"Ошибка разбора документов: {exc}")
-        return
+        raise ValueError("Не удалось открыть XLSX. Нужна обычная книга без пароля.") from exc
+    values = None
+    try:
+        values = load_workbook(BytesIO(content), read_only=True, data_only=True, keep_links=False)
+        if len(formulas.worksheets) > MAX_XLSX_SHEETS:
+            raise ValueError(f"В книге больше {MAX_XLSX_SHEETS} листов.")
+        sheets, budget = {}, 0
+        for ws in formulas.worksheets:
+            if (ws.max_row or 0) > MAX_XLSX_ROWS or (ws.max_column or 0) > MAX_XLSX_COLUMNS:
+                raise ValueError(f"Лист «{ws.title}»: лимит {MAX_XLSX_ROWS} строк и {MAX_XLSX_COLUMNS} колонок. Удалите лишние пустые строки/колонки и их форматирование.")
+            rows, missing, errors = [], 0, 0
+            for formula_row, cached_row in zip(ws.iter_rows(), values[ws.title].iter_rows()):
+                if len(rows) >= MAX_XLSX_ROWS or len(formula_row) > MAX_XLSX_COLUMNS:
+                    raise ValueError(f"Лист «{ws.title}» превышает лимит строк или колонок.")
+                budget += len(formula_row)
+                if budget > MAX_XLSX_CELLS:
+                    raise ValueError(f"В книге больше {MAX_XLSX_CELLS} ячеек. Разделите файл.")
+                row = []
+                for cell, cached in zip(formula_row, cached_row):
+                    value = cached.value
+                    if cell.data_type == "f" and value is None:
+                        missing += 1
+                    if cached.data_type == "e":
+                        errors += 1
+                        value = None
+                    row.append(value)
+                rows.append(tuple(row))
+            while rows and not any(excel_value(v) for v in rows[-1]):
+                rows.pop()
+            sheets[ws.title] = {"rows": tuple(rows), "header_row": suggest_header_row(rows),
+                               "missing_formulas": missing, "error_cells": errors}
+        return sheets
+    finally:
+        formulas.close()
+        if values is not None:
+            values.close()
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def xlsx_table(sheet, header_row=1):
+    rows = sheet["rows"]
+    if not isinstance(header_row, int) or not 1 <= header_row <= max(1, len(rows)):
+        raise ValueError("Строка заголовков отсутствует на листе.")
+    if not rows:
+        return {"columns": [], "records": [], "date_columns": []}
+    width = max((i + 1 for row in rows[header_row - 1:] for i, v in enumerate(row) if excel_value(v)), default=0)
+    header = rows[header_row - 1]
+    columns, used = [], set()
+    for i in range(width):
+        original = normalize_spaces(excel_value(header[i])) if i < len(header) else ""
+        base = original or f"Колонка {i + 1}"
+        label, suffix = base, 2
+        while label in used:
+            label = f"{base} ({suffix})"
+            suffix += 1
+        used.add(label)
+        columns.append({"id": f"c{i}", "label": label, "original": original})
+    records, date_cols = [], set()
+    for row_number, row in enumerate(rows[header_row:], header_row + 1):
+        cells, dates = {}, {}
+        for i, column in enumerate(columns):
+            value = row[i] if i < len(row) else None
+            cells[column["id"]] = excel_value(value)
+            parsed_date = excel_date(value)
+            if parsed_date is not None:
+                dates[column["id"]] = parsed_date
+                date_cols.add(column["id"])
+        if any(cells.values()):
+            records.append({"row_number": row_number, "cells": cells, "dates": dates})
+    return {"columns": columns, "records": records,
+            "date_columns": [c["id"] for c in columns if c["id"] in date_cols]}
+
+
+def suggest_xlsx_columns(table):
+    columns = table["columns"]
+    title = next((c["id"] for c in columns if preprocess(c["original"]) in TITLE_ALIASES), None)
+    if title is None:
+        title = next((c["id"] for c in columns if c["id"] not in table["date_columns"]
+                      and preprocess(c["original"]) not in DATE_ALIASES), None)
+    title = title or (columns[0]["id"] if columns else None)
+    search = [c["id"] for c in columns if c["id"] not in table["date_columns"]
+              and preprocess(c["original"]) not in DATE_ALIASES]
+    return {"title_column": title, "search_columns": search or ([title] if title else [])}
+
+
+def parse_xlsx_cases(cfg):
+    if cfg.get("kind") != "xlsx" or "table" not in cfg or "sheet_name" not in cfg:
+        raise ValueError("Источник должен быть настроенным листом XLSX.")
+    table = cfg["table"]
+    columns = {c["id"]: c["label"] for c in table["columns"]}
+    display_labels = {c["id"]: c.get("display_label", c["label"]) for c in table["columns"]}
+    title_col = cfg.get("title_column")
+    search_cols = list(cfg.get("search_columns", list(columns)))
+    display_cols = list(cfg.get("display_columns", list(columns)))
+    if (title_col is not None and title_col not in columns) or any(c not in columns for c in search_cols + display_cols):
+        raise ValueError("Выбрана отсутствующая колонка.")
+    if not search_cols:
+        raise ValueError("Выберите хотя бы одну колонку для поиска.")
+    date_col, start, end = cfg.get("date_column"), cfg.get("date_from"), cfg.get("date_to")
+    if date_col is not None and date_col not in columns:
+        raise ValueError("Колонка даты отсутствует.")
+    if start and end and start > end:
+        raise ValueError("Начальная дата позже конечной.")
+    sheet_id = hashlib.sha256(cfg["sheet_name"].encode("utf-8")).hexdigest()[:16]
+    cases = []
+    for record in table["records"]:
+        cells, row_number = record["cells"], record["row_number"]
+        if date_col is not None:
+            value = record["dates"].get(date_col)
+            if value is None or (start and value < start) or (end and value > end):
+                continue
+        if not any(cells[c] for c in search_cols):
+            continue
+        title = (cells.get(title_col, "") if title_col else "") or f"Строка {row_number}"
+        text = "\n".join(f"{columns[c]}: {cells[c]}" for c in search_cols if cells[c])
+        uid = f'{cfg.get("source_id", cfg["name"])}::sheet:{sheet_id}::row:{row_number}'
+        cases.append({"case_uid": uid, "source_file": cfg["name"], "sheet_name": cfg["sheet_name"],
+                      "row_number": row_number, "title": title, "search_text": text,
+                      "search_proc": preprocess(text), "fields": [
+                          {"label": display_labels[c], "value": cells[c]} for c in display_cols
+                          if cells[c] and c != title_col]})
+    return cases
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def build_database(workbook_configs):
+    """Индексирует только строки настроенных листов XLSX."""
+    rows, identities = [], set()
+    for cfg in workbook_configs:
+        if cfg.get("kind") != "xlsx" or "table" not in cfg or "sheet_name" not in cfg:
+            raise ValueError("Для индекса нужны настроенные листы XLSX.")
+        identity = (cfg.get("source_id", cfg["name"]), cfg["sheet_name"])
+        if identity in identities:
+            raise ValueError("Один лист одного источника выбран несколько раз.")
+        identities.add(identity)
+        rows.extend(parse_xlsx_cases(cfg))
+    df = pd.DataFrame(rows)
     if df.empty:
-        st.warning("Нет кейсов. В TXT нужны заголовки ==текст кейса==. В XLSX проверьте лист, строку заголовков, поисковые колонки и фильтр дат.")
-        return
-    st.caption(f'В базе: {df["case_uid"].nunique()} кейсов · {len(df)} вариантов')
-    if not query.strip():
-        return
-    semantic_ok = enable_semantic
-    if semantic_ok:
-        try:
-            with st.spinner("Подготовка семантического поиска…"):
-                attach_embeddings(df)
-        except Exception as exc:
-            semantic_ok = False
-            st.warning(f"Семантическая модель недоступна. Работает текстовый поиск. Причина: {exc}")
-    try:
-        with st.spinner("Поиск…"):
-            results = search_bundle(query, df, int(top_k), threshold, weight, substring, semantic_ok)
-    except Exception as exc:
-        # Ошибка кодирования запроса тоже не должна отключать текстовый поиск.
-        if not semantic_ok:
-            st.error(f"Ошибка поиска: {exc}")
-            return
-        st.warning(f"Семантический поиск недоступен: {exc}. Показаны текстовые результаты.")
-        semantic_ok = False
-        results = search_bundle(query, df, int(top_k), threshold, weight, substring, False)
-    render_results("Гибридный поиск" if semantic_ok else "Текстовый поиск", results["hybrid"], int(df["case_uid"].nunique()))
-    st.caption("Рейтинг служит для сортировки и не является вероятностью правильного ответа.")
-    if diagnostics:
-        with st.expander("Диагностика", expanded=True):
-            render_results("Семантика", results["semantic"], int(df["case_uid"].nunique()), icon="✨")
-            render_results("Точные фразы, слова и словоформы", results["lexical"], int(df["case_uid"].nunique()), icon="🎯")
-            columns = ["case_uid", "source_file", "source_kind", "sheet_name", "case_index", "title"]
-            catalog = df[columns].drop_duplicates("case_uid")
-            st.dataframe(catalog, use_container_width=True, hide_index=True)
-            st.download_button("Скачать ID кейсов для оценки", catalog.to_csv(index=False).encode("utf-8-sig"),
-                               "case_catalog.csv", "text/csv")
+        return df
+    texts = tuple(row["search_text"] for row in rows)
+    tokens = tuple(tokenize(text) for text in texts)
+    lemmas = tuple(tuple(map(lemmatize_cached, words)) for words in tokens)
+    postings, lemma_postings = defaultdict(set), defaultdict(set)
+    for i, (words, norms) in enumerate(zip(tokens, lemmas)):
+        for word in set(words):
+            postings[word].add(i)
+        for word in set(norms):
+            lemma_postings[word].add(i)
+    df.attrs.update(indexed_texts=texts, tokens=tokens, lemmas=lemmas,
+                    postings=dict(postings), lemma_postings=dict(lemma_postings))
+    return df
 
 
-if __name__ == "__main__":
-    main()
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_embeddings(texts, model_id=MODEL_ID):
+    """Ключ — тексты, а не параметры отображения. Длинные кейсы режутся по токенам."""
+    with model_lock():
+        model = get_model(model_id)
+        max_tokens = max(8, int(model.max_seq_length) - model.tokenizer.num_special_tokens_to_add(pair=False))
+        overlap = min(32, max_tokens // 4)
+        chunks, owners = [], []
+        for i, text in enumerate(texts):
+            ids = model.tokenizer.encode(text, add_special_tokens=False)
+            for start in range(0, max(1, len(ids)), max_tokens - overlap):
+                chunks.append(model.tokenizer.decode(ids[start:start + max_tokens], skip_special_tokens=True))
+                owners.append(i)
+                if start + max_tokens >= len(ids):
+                    break
+        matrix = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True,
+                              batch_size=32, show_progress_bar=False)
+        return np.asarray(matrix, dtype=np.float32), np.asarray(owners, dtype=np.int64)
+
+
+def attach_embeddings(df, model_id=MODEL_ID):
+    if not df.empty:
+        matrix, owners = cached_embeddings(df.attrs["indexed_texts"], model_id)
+        df.attrs.update(phrase_embs=matrix, embedding_owners=owners, model_id=model_id)
+    return df
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def encode_query(query, model_id=MODEL_ID):
+    with model_lock():
+        return np.asarray(get_model(model_id).encode(normalize_spaces(query), convert_to_numpy=True,
+                          normalize_embeddings=True, show_progress_bar=False), dtype=np.float32)
+
+
+def semantic_scores(query, df):
+    if df.empty or not tokenize(query) or "phrase_embs" not in df.attrs:
+        return None
+    vector = encode_query(query, df.attrs.get("model_id", MODEL_ID))
+    scores = np.clip(df.attrs["phrase_embs"] @ vector.reshape(-1), -1.0, 1.0)
+    result = np.full(len(df), -1.0, dtype=np.float32)
+    np.maximum.at(result, df.attrs.get("embedding_owners", np.arange(len(df))), scores)
+    return result
+
+
+def _result_from_row(row, score=None, **details):
+    result = {key: row[key] for key in ("case_uid", "source_file", "sheet_name", "row_number", "title", "fields", "search_text")}
+    result["row_number"] = int(result["row_number"])
+    if score is not None:
+        result["score"] = float(score)
+    result.update(details)
+    return result
+
+
+def deduplicate_results(results, top_k):
+    best = {}
+    for item in results:
+        prev = best.get(item["case_uid"])
+        if prev is None or item.get("score", 1) > prev.get("score", 1):
+            best[item["case_uid"]] = item
+    return sorted(best.values(), key=lambda item: (-item.get("score", 1), item["case_uid"]))[:max(0, top_k)]
+
+
+def _contains_phrase(words, query_words):
+    return any(words[start:start + len(query_words)] == query_words
+               for start in range(len(words) - len(query_words) + 1))
+
+
+def lexical_scores(query, df, allow_substring=False):
+    result = np.zeros(len(df), dtype=np.float32)
+    kinds = {}
+    words = tokenize(query)
+    if not words or df.empty:
+        return result, kinds
+    norms = tuple(map(lemmatize_cached, words))
+    attrs = df.attrs
+    tokens, lemmas = attrs["tokens"], attrs["lemmas"]
+    exact = set.intersection(*(attrs["postings"].get(w, set()) for w in set(words)))
+    inflected = set.intersection(*(attrs["lemma_postings"].get(w, set()) for w in set(norms)))
+    candidates = exact | inflected
+    for i in candidates:
+        if _contains_phrase(tokens[i], words):
+            result[i], kinds[i] = 3.0, "Фраза целиком"
+        elif not (Counter(words) - Counter(tokens[i])):
+            result[i], kinds[i] = 2.0, "Все слова"
+        elif not (Counter(norms) - Counter(lemmas[i])):
+            result[i], kinds[i] = 1.0, "Словоформы"
+    if allow_substring:
+        texts = attrs["indexed_texts"]
+        for i, text in enumerate(texts):
+            if result[i] == 0 and preprocess(query) in preprocess(text):
+                result[i], kinds[i] = 0.3, "Часть слова (слабый сигнал)"
+    return result, kinds
+
+
+def search_bundle(query, df, top_k=5, threshold=0.5, semantic_weight=0.65,
+                  allow_substring=False, use_semantic=True):
+    if not 0 <= semantic_weight <= 1 or not -1 <= threshold <= 1:
+        raise ValueError("Некорректные параметры поиска.")
+    lex, kinds = lexical_scores(query, df, allow_substring)
+    sem = semantic_scores(query, df) if use_semantic else None
+    hybrid, semantic, lexical = [], [], []
+    for i in range(len(df)):
+        lscore = float(lex[i])
+        sscore = float(sem[i]) if sem is not None else None
+        if lscore > 0:
+            lexical.append(_result_from_row(df.iloc[i], lscore, match_type=kinds[i]))
+        if sscore is not None and sscore >= threshold:
+            semantic.append(_result_from_row(df.iloc[i], sscore))
+        if not (lscore > 0 or (sscore is not None and sscore >= threshold)):
+            continue
+        if sem is None:
+            combined = lscore / 3
+        else:
+            combined = semantic_weight * max(0, sscore) + (1 - semantic_weight) * lscore / 3
+        if lscore == 3:
+            combined += 0.15
+        hybrid.append(_result_from_row(df.iloc[i], combined, semantic_score=sscore,
+                      lexical_score=lscore, match_type=kinds.get(i, "Семантика")))
+    return {"hybrid": deduplicate_results(hybrid, top_k),
+            "semantic": deduplicate_results(semantic, top_k),
+            "lexical": deduplicate_results(lexical, top_k)}
+
+
+def semantic_search(query, df, top_k=5, threshold=0.5):
+    return search_bundle(query, df, top_k, threshold)["semantic"]
+
+
+def keyword_search(query, df, top_k=5):
+    return search_bundle(query, df, top_k, use_semantic=False)["lexical"]
+
+
+def hybrid_search(query, df, top_k=5, threshold=0.5, semantic_weight=0.65):
+    return search_bundle(query, df, top_k, threshold, semantic_weight)["hybrid"]
